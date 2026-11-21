@@ -1,0 +1,115 @@
+import "pkg:rtp" as rtp
+import "std:aes"
+import "std:sha1"
+import "std:buffer"
+import "std:arena"
+
+; AES_CM_128_HMAC_SHA1_80, KDR=0, one SSRC/direction per context, no MKI or
+; encrypted header extensions. Mutable replay/nonce history is held by one
+; arena-owned Buffer, so copying a context never forks that history.
+resource type SRTP = { memory:Ref<Buffer> } drop srtp_release
+private fn srtp_word(value:i64,width:i64) -> Arr u8 _
+  = check width>=0 && width<=8 in arr(i in 0..width) u8(bit_and(shift_right(value,(width-1-i)*8),255))
+fn srtp_derive(master:Arr u8 n,salt:Arr u8 m,label:i64,length:i64) -> BytesResult
+  = if n!=16 || m!=14 || label<0 || label>5 || length<1 || length>32 then bytes_error(22,"invalid SRTP derivation",0) else
+    let iv=arr(i in 0..16) u8(if i>=14 then 0 else bit_xor(i64(salt[i]),if i==7 then label else 0)) in
+    aes128_ctr(aes128_key(master),iv,arr(i in 0..length) u8(0))
+effect(process) fn srtp_new(arena:Arena,master:Arr u8 n,salt:Arr u8 m,ssrc:i64) -> SRTP
+  = using memory=buffer_new(256) in let status=buffer_status(memory) in check status.ok in
+    let encryption=srtp_derive(master,salt,0,16) in let authentication=srtp_derive(master,salt,1,20) in let media_salt=srtp_derive(master,salt,2,14) in
+    let valid=n==16 && m==14 && ssrc>=0 && ssrc<=4294967295 && encryption.ok && authentication.ok && media_salt.ok in
+    let initialized=buffer_store_i64(memory,0,if valid then 1 else 0) in let written=buffer_store_i64(memory,8,ssrc) in
+    let highest=buffer_store_i64(memory,16, -1) in let replay=buffer_store_i64(memory,24,0) in
+    let e=buffer_write(memory,64,encryption.value) in let a=buffer_write(memory,80,authentication.value) in let s=buffer_write(memory,100,media_salt.value) in
+    let control_encryption=srtp_derive(master,salt,3,16) in let control_auth=srtp_derive(master,salt,4,20) in let control_salt=srtp_derive(master,salt,5,14) in
+    let e=buffer_write(memory,128,control_encryption.value) in let a=buffer_write(memory,144,control_auth.value) in let s=buffer_write(memory,164,control_salt.value) in
+    let control_highest=buffer_store_i64(memory,40, -1) in SRTP { memory=adopt(memory,arena) }
+effect(process) fn srtp_status(context:SRTP) -> IntResult
+  = if !ref_live(context.memory) then int_error(9,"SRTP context owner closed",0) else
+    let valid=buffer_load_i64(borrow_ref(context.memory),0) in if !valid.ok || valid.value!=1 then int_error(22,"invalid SRTP context",0) else int_ok(0)
+private fn srtp_header_length(packet:Arr u8 n) -> i64
+  = if n<12 || bit_and(str_byte(packet,0),192)!=128 then -1 else
+    let base=12+bit_and(str_byte(packet,0),15)*4 in if base>n then -1 else
+    if bit_and(str_byte(packet,0),16)==0 then base else
+      if base+4>n then -1 else let size=(str_byte(packet,base+2)*256+str_byte(packet,base+3))*4+base+4 in if size>n then -1 else size
+private fn srtp_u32(bytes:Arr u8 _,offset:i64) -> i64
+  = loop(i=0,value=0) while i<4 next(i+1,value*256+str_byte(bytes,offset+i)) yield value
+private effect(process) fn srtp_index(context:SRTP,sequence:i64) -> i64
+  = let highest=buffer_load_i64(borrow_ref(context.memory),16).value in
+    if highest<0 then sequence else
+    let roc=highest/65536 in let previous=highest%65536 in
+    let guessed=if previous<32768 && sequence-previous>32768 then roc-1 else if previous>=32768 && previous-32768>sequence then roc+1 else roc in
+    if guessed<0 || guessed>4294967295 then -1 else guessed*65536+sequence
+private effect(process) fn srtp_replayed(context:SRTP,index:i64) -> bool
+  = let highest=buffer_load_i64(borrow_ref(context.memory),16).value in let replay=buffer_load_i64(borrow_ref(context.memory),24).value in
+    index<0 || highest>=index && (highest-index>=64 || bit_and(shift_right(replay,highest-index),1)!=0)
+private effect(process) fn srtp_commit(context:SRTP,index:i64) -> unit
+  = let highest=buffer_load_i64(borrow_ref(context.memory),16).value in let replay=buffer_load_i64(borrow_ref(context.memory),24).value in
+    let updated=if index>highest then if highest<0 || index-highest>=64 then 1 else bit_or(shift_left(replay,index-highest),1) else bit_or(replay,shift_left(1,highest-index)) in
+    let saved=buffer_store_i64(borrow_ref(context.memory),16,if index>highest then index else highest) in let bits=buffer_store_i64(borrow_ref(context.memory),24,updated) in noop()
+private effect(process) fn srtp_crypt(context:SRTP,index:i64,payload:Arr u8 n) -> BytesResult
+  = let salt=buffer_read(borrow_ref(context.memory),100,14).value in let ssrc=buffer_load_i64(borrow_ref(context.memory),8).value in
+    let id=srtp_word(ssrc,4) in let sequence=srtp_word(index,6) in
+    let iv=arr(i in 0..16) u8(bit_xor(if i<14 then str_byte(salt,i) else 0,
+      if i>=4 && i<8 then str_byte(id,i-4) else if i>=8 && i<14 then str_byte(sequence,i-8) else 0)) in
+    let key=buffer_read(borrow_ref(context.memory),64,16).value in aes128_ctr(aes128_key(key),iv,payload)
+private effect(process) fn srtp_tag(context:SRTP,index:i64,packet:Arr u8 _) -> Arr u8 _
+  = let key=buffer_read(borrow_ref(context.memory),80,20).value in str_slice(hmac_sha1(key,concat(packet,srtp_word(index/65536,4))),0,10)
+effect(process) fn srtp_encrypt(context:SRTP,packet:Arr u8 n) -> BytesResult
+  = let status=srtp_status(context) in if !status.ok then bytes_error(status.error.code,status.error.message,0) else
+    let decoded=rtp::rtp_parse(packet) in let header=srtp_header_length(packet) in
+    let ssrc=buffer_load_i64(borrow_ref(context.memory),8).value in let highest=buffer_load_i64(borrow_ref(context.memory),16).value in
+    let index=srtp_index(context,decoded.sequence) in
+    if !decoded.ok || header<0 || decoded.ssrc!=ssrc || index<0 || index<=highest then bytes_error(22,"invalid/reused SRTP send index or SSRC",0) else
+    let encrypted=srtp_crypt(context,index,str_slice(packet,header,n)) in if !encrypted.ok then encrypted else
+    let body=concat(str_slice(packet,0,header),encrypted.value) in let tag=srtp_tag(context,index,body) in
+    let committed=srtp_commit(context,index) in bytes_ok(concat(body,tag))
+effect(process) fn srtp_decrypt(context:SRTP,packet:Arr u8 n) -> BytesResult
+  = let status=srtp_status(context) in if !status.ok then bytes_error(status.error.code,status.error.message,0) else
+    let header=srtp_header_length(packet) in let sequence=str_byte(packet,2)*256+str_byte(packet,3) in
+    let index=srtp_index(context,sequence) in let ssrc=buffer_load_i64(borrow_ref(context.memory),8).value in
+    if header<0 || n<header+10 || n>65545 || srtp_u32(packet,8)!=ssrc || index<0 || srtp_replayed(context,index) then bytes_error(74,"invalid or replayed SRTP packet",0) else
+    let body=str_slice(packet,0,n-10) in let tag=srtp_tag(context,index,body) in
+    if !crypto_equal(tag,str_slice(packet,n-10,n)) then bytes_error(74,"SRTP authentication failed",0) else
+    let decrypted=srtp_crypt(context,index,str_slice(body,header,len(body))) in if !decrypted.ok then decrypted else
+    let plaintext=concat(str_slice(body,0,header),decrypted.value) in
+    if !rtp::rtp_parse(plaintext).ok then bytes_error(74,"invalid authenticated RTP payload",0) else
+      let committed=srtp_commit(context,index) in bytes_ok(plaintext)
+
+private effect(fs,net,process) fn srtp_release(context:SRTP) -> unit = ref_release(context.memory)
+
+private fn srtcp_valid(packet:Arr u8 n) -> bool
+  = n>=8 && n<=65535 && n%4==0 && loop(at=0,valid=true) while valid && at<n next(
+    let size=(str_byte(packet,at+2)*256+str_byte(packet,at+3)+1)*4 in at+size,
+    let size=(str_byte(packet,at+2)*256+str_byte(packet,at+3)+1)*4 in
+    let padding=bit_and(str_byte(packet,at),32)!=0 in let amount=if padding then str_byte(packet,at+size-1) else 0 in
+    at+4<=n && bit_and(str_byte(packet,at),192)==128 && str_byte(packet,at+1)>=192 && str_byte(packet,at+1)<=223 && size>=4 && size<=n-at &&
+    (!padding || at+size==n && amount>0 && amount<=size-4)) yield valid && at==n
+private effect(process) fn srtcp_crypt(context:SRTP,index:i64,payload:Arr u8 _) -> BytesResult
+  = let salt=buffer_read(borrow_ref(context.memory),164,14).value in let ssrc=buffer_load_i64(borrow_ref(context.memory),8).value in
+    let id=srtp_word(ssrc,4) in let sequence=srtp_word(index,6) in
+    let iv=arr(i in 0..16) u8(bit_xor(if i<14 then str_byte(salt,i) else 0,
+      if i>=4 && i<8 then str_byte(id,i-4) else if i>=8 && i<14 then str_byte(sequence,i-8) else 0)) in
+    aes128_ctr(aes128_key(buffer_read(borrow_ref(context.memory),128,16).value),iv,payload)
+private effect(process) fn srtcp_tag(context:SRTP,packet:Arr u8 _) -> Arr u8 _
+  = str_slice(hmac_sha1(buffer_read(borrow_ref(context.memory),144,20).value,packet),0,10)
+effect(process) fn srtcp_encrypt(context:SRTP,packet:Arr u8 n) -> BytesResult
+  = let status=srtp_status(context) in if !status.ok then bytes_error(status.error.code,status.error.message,0) else
+    let previous=buffer_load_i64(borrow_ref(context.memory),32).value in let ssrc=buffer_load_i64(borrow_ref(context.memory),8).value in
+    if !srtcp_valid(packet) || srtp_u32(packet,4)!=ssrc then bytes_error(22,"invalid RTCP compound or SSRC",0) else
+    if previous>=2147483647 then bytes_error(75,"SRTCP send index exhausted",0) else
+    let index=previous+1 in let encrypted=srtcp_crypt(context,index,str_slice(packet,8,n)) in if !encrypted.ok then encrypted else
+    let body=concat(str_slice(packet,0,8),encrypted.value,srtp_word(bit_or(index,2147483648),4)) in let tag=srtcp_tag(context,body) in
+    let committed=buffer_store_i64(borrow_ref(context.memory),32,index) in bytes_ok(concat(body,tag))
+effect(process) fn srtcp_decrypt(context:SRTP,packet:Arr u8 n) -> BytesResult
+  = let status=srtp_status(context) in if !status.ok then bytes_error(status.error.code,status.error.message,0) else
+    if n<22 || n>65549 || bit_and(str_byte(packet,0),192)!=128 || srtp_u32(packet,4)!=buffer_load_i64(borrow_ref(context.memory),8).value then bytes_error(74,"invalid SRTCP header",0) else
+    let raw=srtp_u32(packet,n-14) in let index=bit_and(raw,2147483647) in
+    let highest=buffer_load_i64(borrow_ref(context.memory),40).value in let replay=buffer_load_i64(borrow_ref(context.memory),48).value in
+    if highest>=index && (highest-index>=64 || bit_and(shift_right(replay,highest-index),1)!=0) then bytes_error(74,"SRTCP replay",0) else
+    let body=str_slice(packet,0,n-10) in if !crypto_equal(srtcp_tag(context,body),str_slice(packet,n-10,n)) then bytes_error(74,"SRTCP authentication failed",0) else
+    let payload=str_slice(packet,8,n-14) in let decrypted=if bit_and(raw,2147483648)!=0 then srtcp_crypt(context,index,payload) else bytes_ok(payload) in
+    if !decrypted.ok then decrypted else let plaintext=concat(str_slice(packet,0,8),decrypted.value) in
+    if !srtcp_valid(plaintext) then bytes_error(74,"invalid authenticated RTCP compound",0) else
+    let updated=if index>highest then if highest<0 || index-highest>=64 then 1 else bit_or(shift_left(replay,index-highest),1) else bit_or(replay,shift_left(1,highest-index)) in
+    let saved=buffer_store_i64(borrow_ref(context.memory),40,if index>highest then index else highest) in let saved=buffer_store_i64(borrow_ref(context.memory),48,updated) in bytes_ok(plaintext)

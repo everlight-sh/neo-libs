@@ -1,0 +1,28 @@
+import "pkg:audio" as audio
+import "pkg:rtp" as rtp
+import "pkg:opus-packet" as opus
+import "std:json"
+import "std:io"
+import "std:vec"
+effect(fs,env) fn main() -> unit
+  = let mode=int_parse(cli_arg(1).value).value in let raw=file_read(0,4194304) in check raw.ok in
+    let result=if mode==0 || mode==1 then audio::g711_decode(raw.value,mode==1) else
+    if mode==2 || mode==3 then audio::g711_encode(raw.value,mode==3) else
+    if mode==4 then
+      let packet=rtp::rtp_parse(raw.value) in if !packet.ok then bytes_error(1,"invalid",0) else
+      bytes_ok(concat(int_text(packet.sequence)," ",int_text(packet.timestamp)," ",int_text(packet.ssrc)," ",json_quote(packet.payload))) else
+    if mode==5 then let packet=rtp::rtp_parse(raw.value) in rtp::rtp_encode(packet) else
+    if mode==6 then let packet=opus::opus_packet(raw.value) in if !packet.ok then bytes_error(1,"invalid",0) else
+      bytes_ok(concat(int_text(len(packet.frames))," ",int_text(packet.samples_48k)," ",
+        loop(i=0,out="") while i<len(packet.frames) next(i+1,check i>=0 && i<len(packet.frames) in concat(out,int_text(packet.frames[i].offset),":",int_text(packet.frames[i].length),",")) yield out)) else
+    if mode==7 then
+      let parsed=json_parse(raw.value) in let list=json_array_values(parsed.value) in
+      let ordered=loop(i=0,state=rtp::rtp_order_new(),out="") while i<len(list) next(i+1,
+        check i>=0 && i<len(list) in let seq=json_int(json_get(list[i],"seq").value) in let now=json_int(json_get(list[i],"now").value) in
+          if !seq.ok then rtp::rtp_order_tick(state,now.value,false).state else
+          rtp::rtp_order_push(state,rtp::RTPPacket { ok=true,sequence=seq.value,timestamp=0,ssrc=1,marker=false,payload_type=0,csrc=arr(j in 0..0) 0,extension_profile= -1,extension="",payload="" },now.value).state,
+        check i>=0 && i<len(list) in let seq=json_int(json_get(list[i],"seq").value) in let now=json_int(json_get(list[i],"now").value) in
+          let release=if !seq.ok then rtp::rtp_order_tick(state,now.value,false) else rtp::rtp_order_push(state,rtp::RTPPacket { ok=true,sequence=seq.value,timestamp=0,ssrc=1,marker=false,payload_type=0,csrc=arr(j in 0..0) 0,extension_profile= -1,extension="",payload="" },now.value) in
+          loop(j=0,bytes=out) while j<vec_len(release.packets) next(j+1,match vec_get(release.packets,j) { None => bytes,Some(packet) => concat(bytes,int_text(packet.sequence),",") }) yield bytes) yield
+          concat(out," lost=",int_text(rtp::rtp_order_lost(state))," late=",int_text(rtp::rtp_order_late(state))) in bytes_ok(ordered) else bytes_error(22,"mode",0) in
+    let output=print_out(if result.ok then result.value else "error") in noop()

@@ -1,0 +1,176 @@
+import "scram.neo"
+import "std:transport"
+import "std:random"
+import "std:json"
+import "std:vec"
+
+; PostgreSQL v3 wire protocol over caller-owned TCP/TLS transports. One request
+; at a time per connection. Extended-protocol text parameters never enter SQL.
+; Trust, SCRAM-SHA-256, and cleartext authentication over verified TLS only.
+; SCRAM passwords use the ASCII SASLprep profile. MD5, COPY, replication and
+; binary column formats are intentionally unsupported. Text results preserve
+; exact numbers; SQL NULL becomes JSON null. Duplicate column names need aliases.
+sealed type PGConnection<C> = {io:HttpIO<C>,buffer:Arr u8 _,ok:bool,error:Error,transaction:Arr u8 _}
+type PGFrame<C> = {connection:PGConnection<C>,ok:bool,kind:i64,payload:Arr u8 _}
+type PGParam={is_null:bool,value:Arr u8 _}
+type PGResult<C> = {connection:PGConnection<C>,ok:bool,rows:Json,command:Arr u8 _,error:Error}
+fn pg_text(value:Arr u8 n)->PGParam=PGParam {is_null=false,value=value}
+fn pg_int(value:i64)->PGParam=pg_text(int_text(value))
+fn pg_null()->PGParam=PGParam {is_null=true,value=""}
+
+; A deliberately small SQL builder: ASCII identifiers are quoted, values remain
+; separate Bind parameters, and update/delete require an explicit predicate.
+type PGField={name:Arr u8 _,value:PGParam}
+sealed type PGStatement={ok:bool,sql:Arr u8 _,params:Arr PGParam _,error:Error}
+fn pg_field(name:Arr u8 n,value:PGParam)->PGField=PGField {name=name,value=value}
+private fn pg_identifier(name:Arr u8 n)->Arr u8 _
+  = let valid=n>=1 && n<=63 && loop(i=0,ok=true) while ok && i<n next(i+1,
+      let c=str_byte(name,i) in c>=65 && c<=90 || c>=97 && c<=122 || c==95 || i>0 && c>=48 && c<=57) yield ok in
+    if valid then concat("\"",name,"\"") else ""
+private fn pg_fields_valid(fields:Arr PGField n)->bool
+  = n<=128 && loop(i=0,ok=true) while ok && i<n next(i+1,check i>=0 && i<n in len(pg_identifier(fields[i].name))>0) yield ok
+private fn pg_predicates(fields:Arr PGField n,offset:i64)->Arr u8 _
+  = loop(i=0,out="") while i<n next(i+1,check i>=0 && i<n in
+      concat(out,if i==0 then "" else " AND ",pg_identifier(fields[i].name)," IS NOT DISTINCT FROM $",int_text(offset+i+1))) yield out
+private fn pg_bad_statement()->PGStatement
+  = PGStatement {ok=false,sql="",params=arr(i in 0..0) pg_null(),error=Error {code=22,message="Invalid SQL builder identifiers, bounds or missing mutation predicate",position=0}}
+fn pg_select(table:Arr u8 t,columns:Arr Arr u8 _ n,where:Arr PGField m,limit:i64)->PGStatement
+  = let valid=len(pg_identifier(table))>0 && n>=1 && n<=128 && limit>=1 && limit<=10000 && pg_fields_valid(where) &&
+      loop(i=0,ok=true) while ok && i<n next(i+1,check i>=0 && i<n in len(pg_identifier(columns[i]))>0) yield ok in
+    if !valid then pg_bad_statement() else
+    let selected=loop(i=0,out="") while i<n next(i+1,check i>=0 && i<n in concat(out,if i==0 then "" else ",",pg_identifier(columns[i]))) yield out in
+    PGStatement {ok=true,sql=concat("SELECT ",selected," FROM ",pg_identifier(table),if m>0 then concat(" WHERE ",pg_predicates(where,0)) else ""," LIMIT ",int_text(limit)),
+      params=arr(i in 0..m) where[i].value,error=no_error()}
+fn pg_insert(table:Arr u8 t,fields:Arr PGField n)->PGStatement
+  = if len(pg_identifier(table))==0 || n<1 || !pg_fields_valid(fields) then pg_bad_statement() else
+    let columns=loop(i=0,out="") while i<n next(i+1,check i>=0 && i<n in concat(out,if i==0 then "" else ",",pg_identifier(fields[i].name))) yield out in
+    let values=loop(i=0,out="") while i<n next(i+1,concat(out,if i==0 then "" else ",","$",int_text(i+1))) yield out in
+    PGStatement {ok=true,sql=concat("INSERT INTO ",pg_identifier(table)," (",columns,") VALUES (",values,") RETURNING *"),params=arr(i in 0..n) fields[i].value,error=no_error()}
+fn pg_update(table:Arr u8 t,fields:Arr PGField n,where:Arr PGField m)->PGStatement
+  = if len(pg_identifier(table))==0 || n<1 || m<1 || !pg_fields_valid(fields) || !pg_fields_valid(where) then pg_bad_statement() else
+    let assignments=loop(i=0,out="") while i<n next(i+1,check i>=0 && i<n in concat(out,if i==0 then "" else ",",pg_identifier(fields[i].name),"=$",int_text(i+1))) yield out in
+    PGStatement {ok=true,sql=concat("UPDATE ",pg_identifier(table)," SET ",assignments," WHERE ",pg_predicates(where,n)," RETURNING *"),
+      params=arr(i in 0..n+m) if i<n then fields[i].value else where[i-n].value,error=no_error()}
+fn pg_delete(table:Arr u8 t,where:Arr PGField n)->PGStatement
+  = if len(pg_identifier(table))==0 || n<1 || !pg_fields_valid(where) then pg_bad_statement() else
+    PGStatement {ok=true,sql=concat("DELETE FROM ",pg_identifier(table)," WHERE ",pg_predicates(where,0)," RETURNING *"),params=arr(i in 0..n) where[i].value,error=no_error()}
+private fn pg_number(value:i64,width:i64{width>=0,width<=8})->Arr u8 _ = arr(i in 0..width) u8(bit_and(shift_right(value,(width-i-1)*8),255))
+private fn pg_u32(bytes:Arr u8 n,at:i64)->i64
+  = if at<0 || at+4>n then -2 else let value=loop(i=0,out=0) while i<4 next(i+1,out*256+str_byte(bytes,at+i)) yield out in if value==4294967295 then -1 else value
+private fn pg_u16(bytes:Arr u8 n,at:i64)->i64 = if at<0 || at+2>n then -1 else str_byte(bytes,at)*256+str_byte(bytes,at+1)
+private fn pg_zero(bytes:Arr u8 n,at:i64)->i64
+  = let found=str_find(str_slice(bytes,at,n),"\0") in if found.present then at+found.value else -1
+private fn pg_packet(kind:Arr u8 n,payload:Arr u8 m)->Arr u8 _=concat(kind,pg_number(m+4,4),payload)
+private fn pg_broken<C>(connection:PGConnection<C>,code:i64,message:Arr u8 n)->PGConnection<C>
+  = connection with {ok=false,error=Error {code=code,message=message,position=0}}
+private effect(net,time,process) fn pg_fill<C>(connection:PGConnection<C>,size:i64,deadline:i64)->PGConnection<C>
+  = loop(state=connection) while state.ok && len(state.buffer)<size next(
+      let read=state.io.read in let piece=read(state.io.context,deadline) in
+      if !piece.ok then pg_broken(state,piece.error.code,piece.error.message) else if len(piece.value)==0 then pg_broken(state,5,"PostgreSQL connection closed") else
+      if len(state.buffer)+len(piece.value)>16777221 then pg_broken(state,27,"PostgreSQL message exceeds 16 MiB") else state with {buffer=concat(state.buffer,piece.value)}) yield state
+private effect(net,time,process) fn pg_frame<C>(connection:PGConnection<C>,deadline:i64)->PGFrame<C>
+  = let header=pg_fill(connection,5,deadline) in let size=pg_u32(header.buffer,1) in
+    let state=if !header.ok then header else if size<4 || size>16777220 then pg_broken(header,71,"Invalid PostgreSQL message length") else pg_fill(header,size+1,deadline) in
+    PGFrame::<C> {connection=if state.ok then state with {buffer=str_slice(state.buffer,size+1,len(state.buffer))} else state,ok=state.ok,
+      kind=if state.ok then str_byte(state.buffer,0) else 0,payload=if state.ok then str_slice(state.buffer,5,size+1) else ""}
+private effect(net,time,process) fn pg_send<C>(connection:PGConnection<C>,bytes:Arr u8 n,deadline:i64)->PGConnection<C>
+  = if !connection.ok then connection else let write=connection.io.write in let sent=write(connection.io.context,bytes,deadline) in
+    if !sent.ok || sent.value!=n then pg_broken(connection,if sent.ok then 5 else sent.error.code,"PostgreSQL write failed") else connection
+private fn pg_message(bytes:Arr u8 n)->Arr u8 _
+  = loop(at=0,message="PostgreSQL error") while at<n && str_byte(bytes,at)!=0 next(
+      let end=pg_zero(bytes,at+1) in if end<0 then n else end+1,
+      if str_byte(bytes,at)==77 then str_slice(bytes,at+1,pg_zero(bytes,at+1)) else message) yield message
+sealed type PGAuth<C> = {connection:PGConnection<C>,nonce:Arr u8 _,bare:Arr u8 _,signature:Arr u8 _,stage:i64,verified:bool,done:bool}
+private effect(net,time,process) fn pg_auth_step<C>(state:PGAuth<C>,user:Arr u8 n,password:Arr u8 m,encrypted:bool,deadline:i64)->PGAuth<C>
+  = let frame=pg_frame(state.connection,deadline) in let state=state with {connection=frame.connection} in
+    if !frame.ok then state with {done=true} else if frame.kind==69 then state with {connection=pg_broken(state.connection,13,pg_message(frame.payload)),done=true} else
+    if frame.kind==90 then state with {connection=if state.verified then state.connection with {transaction=frame.payload} else pg_broken(state.connection,13,"Authentication was not verified"),done=true} else
+    if frame.kind!=82 then state else let kind=pg_u32(frame.payload,0) in
+    if kind==0 then if state.stage==0 || state.stage==3 then state with {verified=true} else state with {connection=pg_broken(state.connection,13,"SCRAM server proof missing"),done=true} else
+    if kind==3 && encrypted && state.stage==0 then state with {connection=pg_send(state.connection,pg_packet("p",concat(password,"\0")),deadline)} else
+    if kind==10 && state.stage==0 && str_find(frame.payload,"SCRAM-SHA-256\0").present then
+      let entropy=random_bytes(18) in if !entropy.ok then state with {connection=pg_broken(state.connection,5,"SCRAM randomness unavailable"),done=true} else
+      let nonce=base64_encode(entropy.value) in let bare=concat("n=",user,",r=",nonce) in let first=concat("n,,",bare) in
+      state with {connection=pg_send(state.connection,pg_packet("p",concat("SCRAM-SHA-256\0",pg_number(len(first),4),first)),deadline),nonce=nonce,bare=bare,stage=1} else
+    if kind==11 && state.stage==1 then
+      let proof=pg_scram_proof(password,state.nonce,state.bare,str_slice(frame.payload,4,len(frame.payload))) in
+      if !proof.ok then state with {connection=pg_broken(state.connection,13,"Invalid SCRAM challenge"),done=true} else
+      state with {connection=pg_send(state.connection,pg_packet("p",proof.proof),deadline),signature=proof.signature,stage=2} else
+    if kind==12 && state.stage==2 && crypto_equal(pg_scram_field(str_slice(frame.payload,4,len(frame.payload)),"v").value,state.signature) then state with {stage=3} else
+      state with {connection=pg_broken(state.connection,13,"Unsupported or invalid PostgreSQL authentication"),done=true}
+effect(net,time,process) fn pg_connect<C>(io:HttpIO<C>,user:Arr u8 n,database:Arr u8 m,password:Arr u8 k,encrypted:bool,deadline:i64)->PGConnection<C>
+  = let initial=PGConnection::<C> {io=io,buffer="",ok=true,error=no_error(),transaction=""} in
+    if n<1 || n>128 || m<1 || m>128 || k>1024 || str_find(user,"\0").present || str_find(user,"=").present || str_find(user,",").present || str_find(database,"\0").present ||
+      !loop(i=0,valid=true) while valid && i<k next(i+1,let c=str_byte(password,i) in c>=32 && c<=126) yield valid then pg_broken(initial,22,"Invalid PostgreSQL startup fields or non-ASCII SCRAM password") else
+    let body=concat(pg_number(196608,4),"user\0",user,"\0database\0",database,"\0client_encoding\0UTF8\0\0") in
+    let connection=pg_send(initial,concat(pg_number(len(body)+4,4),body),deadline) in
+    loop(state=PGAuth::<C> {connection=connection,nonce="",bare="",signature="",stage=0,verified=false,done=false},frames=0) while state.connection.ok && !state.done && frames<1000
+      next(pg_auth_step(state,user,password,encrypted,deadline),frames+1) yield if state.done then state.connection else pg_broken(state.connection,71,"PostgreSQL startup did not finish")
+private fn pg_bind(params:Arr PGParam n)->BytesResult
+  = if n>1024 then bytes_error(22,"Too many PostgreSQL parameters",0) else
+    let valid=loop(i=0,ok=true) while ok && i<n next(i+1,check i>=0 && i<n in len(params[i].value)<=1048576 && !str_find(params[i].value,"\0").present && utf8_valid(params[i].value)) yield ok in
+    if !valid then bytes_error(22,"Invalid PostgreSQL text parameter",0) else
+    let values=loop(i=0,out="") while i<n next(i+1,check i>=0 && i<n in concat(out,pg_number(if params[i].is_null then -1 else len(params[i].value),4),if params[i].is_null then "" else params[i].value)) yield out in
+    bytes_ok(concat("\0\0",pg_number(0,2),pg_number(n,2),values,pg_number(0,2)))
+type PGColumns={ok:bool,names:Arr Arr u8 _ _}
+private type PGColumnScan={ok:bool,names:Vec<Arr u8 _>}
+private type PGRowScan={ok:bool,body:Arr u8 _}
+private fn pg_columns(payload:Arr u8 n)->PGColumns
+  = let count=pg_u16(payload,0) in let fields=loop(i=0,at=2,ok=count>=0 && count<=1024,names=vec_empty::<Arr u8 _>()) while ok && i<count next(i+1,
+      pg_zero(payload,at)+19,
+      let end=pg_zero(payload,at) in end>=at && end+19<=n,
+      vec_push(names,str_slice(payload,at,pg_zero(payload,at)))) yield PGColumnScan {ok=ok && i==count && at==n,names=names} in
+    let length=vec_len(fields.names) in check length>=0 in PGColumns {ok=fields.ok && count==length,names=arr(i in 0..length) match vec_get(fields.names,i) {None=>"",Some(name)=>name}}
+private fn pg_row(payload:Arr u8 n,columns:Arr Arr u8 _ m)->JsonResult
+  = if pg_u16(payload,0)!=m then JsonResult {ok=false,value=json_none().value,error=Error {code=71,message="Invalid PostgreSQL row",position=0}} else
+    let row=loop(i=0,at=2,ok=true,out="{") while ok && i<m next(i+1,
+      let size=pg_u32(payload,at) in at+4+(if size<0 then 0 else size),
+      let size=pg_u32(payload,at) in size>= -1 && at+4<=n && (size== -1 || at+4+size<=n),
+      check i>=0 && i<m in let size=pg_u32(payload,at) in concat(out,if i==0 then "" else ",",json_quote(columns[i]),":",if size== -1 then "null" else json_quote(str_slice(payload,at+4,at+4+size)))) yield PGRowScan {ok=ok && i==m && at==n,body=out} in
+    if !row.ok then JsonResult {ok=false,value=json_none().value,error=Error {code=71,message="Invalid PostgreSQL row framing",position=0}} else json_parse(concat(row.body,"}"))
+sealed type PGReading<C> = {connection:PGConnection<C>,rows:JsonArrayBuilder,columns:Arr Arr u8 _ _,command:Arr u8 _,error:Error,done:bool}
+private effect(net,time,process) fn pg_read_result<C>(state:PGReading<C>,deadline:i64)->PGReading<C>
+  = let frame=pg_frame(state.connection,deadline) in let state=state with {connection=frame.connection} in
+    if !frame.ok then state with {done=true,error=frame.connection.error} else
+    if frame.kind==69 then state with {error=Error {code=1,message=pg_message(frame.payload),position=0}} else
+    if frame.kind==90 then state with {done=true,connection=state.connection with {transaction=frame.payload}} else
+    if frame.kind==84 then let columns=pg_columns(frame.payload) in if columns.ok then state with {columns=columns.names} else state with {error=Error {code=71,message="Invalid PostgreSQL columns",position=0}} else
+    if frame.kind==68 then let row=pg_row(frame.payload,state.columns) in if row.ok then state with {rows=json_array_builder_push(state.rows,row.value)} else state with {error=row.error} else
+    if frame.kind==67 then state with {command=str_slice(frame.payload,0,len(frame.payload)-1)} else
+    if frame.kind==71 || frame.kind==72 || frame.kind==87 then state with {connection=pg_broken(state.connection,95,"PostgreSQL COPY is unsupported"),done=true,error=Error {code=95,message="PostgreSQL COPY is unsupported",position=0}} else state
+effect(net,time,process) fn pg_query<C>(connection:PGConnection<C>,sql:Arr u8 n,params:Arr PGParam m,deadline:i64)->PGResult<C>
+  = let bound=pg_bind(params) in let valid=connection.ok && n>0 && n<=65536 && !str_find(sql,"\0").present && utf8_valid(sql) && bound.ok in
+    let sent=if !valid then pg_broken(connection,22,"Invalid PostgreSQL query or parameters") else pg_send(connection,
+      concat(pg_packet("P",concat("\0",sql,"\0",pg_number(0,2))),pg_packet("B",bound.value),pg_packet("D","P\0"),pg_packet("E",concat("\0",pg_number(0,4))),pg_packet("S","")),deadline) in
+    let result=loop(state=PGReading::<C> {connection=sent,rows=json_array_builder(),columns=arr(i in 0..0) "",command="",error=if sent.ok then no_error() else sent.error,done=false},frames=0) while state.connection.ok && !state.done && frames<100000
+      next(pg_read_result(state,deadline),frames+1) yield state in
+    let rows=json_array_builder_finish(result.rows) in
+    PGResult::<C> {connection=if result.done then result.connection else pg_broken(result.connection,71,"Incomplete PostgreSQL result"),ok=result.done && result.connection.ok && result.error.code==0 && rows.ok,rows=rows.value,command=result.command,error=if !result.done then Error {code=71,message="PostgreSQL result did not finish",position=0} else result.error}
+
+effect(net,time,process) fn pg_execute<C>(connection:PGConnection<C>,statement:PGStatement,deadline:i64)->PGResult<C>
+  = if statement.ok then pg_query(connection,statement.sql,statement.params,deadline) else
+    PGResult::<C> {connection=connection,ok=false,rows=json_parse("[]").value,command="",error=statement.error}
+
+; Bounded reusable pool bookkeeping. The caller owns transport resources and
+; closes evicted/expired entries. Only idle, healthy connections can be returned;
+; open/failed transactions never cross request boundaries. No automatic replay.
+type PGIdle<C> = {connection:PGConnection<C>,since:i64}
+sealed type PGPool<C> = {entries:Vec<PGIdle<C>>,capacity:i64,ttl:i64}
+type PGLease<C> = {pool:PGPool<C>,connection:Option<PGConnection<C>>,expired:Vec<PGConnection<C>>}
+type PGReturn<C> = {pool:PGPool<C>,accepted:bool,evicted:Option<PGConnection<C>>}
+fn pg_pool<C>(capacity:i64,ttl:i64)->PGPool<C>
+  = check capacity>=1 && capacity<=256 && ttl>=1 && ttl<=3600000 in PGPool::<C> {entries=vec_empty::<PGIdle<C>>(),capacity=capacity,ttl=ttl}
+fn pg_pool_take<C>(pool:PGPool<C>,now:i64)->PGLease<C>
+  = check now>=0 in let found=loop(i=0,index= -1) while index<0 && i<vec_len(pool.entries) next(i+1,
+      match vec_get(pool.entries,i) {None=> -1,Some(entry)=>if entry.since>=0 && now>=entry.since && now-entry.since<=pool.ttl && entry.connection.ok && str_equal(entry.connection.transaction,"I") then i else -1}) yield index in
+    let entries=loop(i=0,out=vec_empty::<PGIdle<C>>()) while i<vec_len(pool.entries) next(i+1,
+      match vec_get(pool.entries,i) {None=>out,Some(entry)=>if i==found || entry.since<0 || now<entry.since || now-entry.since>pool.ttl || !entry.connection.ok || !str_equal(entry.connection.transaction,"I") then out else vec_push(out,entry)}) yield out in
+    let expired=loop(i=0,out=vec_empty::<PGConnection<C>>()) while i<vec_len(pool.entries) next(i+1,
+      match vec_get(pool.entries,i) {None=>out,Some(entry)=>if entry.since<0 || now<entry.since || now-entry.since>pool.ttl || !entry.connection.ok || !str_equal(entry.connection.transaction,"I") then vec_push(out,entry.connection) else out}) yield out in
+    PGLease::<C> {pool=pool with {entries=entries},expired=expired,connection=match vec_get(pool.entries,found) {None=>None::<PGConnection<C>>(),Some(entry)=>Some::<PGConnection<C>>(entry.connection)}}
+fn pg_pool_put<C>(pool:PGPool<C>,connection:PGConnection<C>,now:i64)->PGReturn<C>
+  = check now>=0 in if !connection.ok || !str_equal(connection.transaction,"I") then PGReturn::<C> {pool=pool,accepted=false,evicted=Some::<PGConnection<C>>(connection)} else
+    let full=vec_len(pool.entries)>=pool.capacity in
+    let entries=loop(i=if full then 1 else 0,out=vec_empty::<PGIdle<C>>()) while i<vec_len(pool.entries) next(i+1,match vec_get(pool.entries,i) {None=>out,Some(entry)=>vec_push(out,entry)}) yield out in
+    PGReturn::<C> {pool=pool with {entries=vec_push(entries,PGIdle::<C> {connection=connection,since=now})},accepted=true,
+      evicted=if full then match vec_get(pool.entries,0) {None=>None::<PGConnection<C>>(),Some(entry)=>Some::<PGConnection<C>>(entry.connection)} else None::<PGConnection<C>>()}

@@ -1,0 +1,23 @@
+import "std:http_client"
+import "std:vec"
+
+; Bounded origin-keyed pool of caller-owned transports. A capture should contain
+; generational arena references, never raw fds. No automatic request retries:
+; replaying a POST after an ambiguous failure could repeat a tool side effect.
+type PooledHTTP<C> = { origin:Arr u8 _,io:HttpIO<C>,idle_since:i64 }
+sealed type HTTPPool<C> = { entries:Vec<PooledHTTP<C>>,capacity:i64,ttl:i64 }
+type PoolTake<C> = { pool:HTTPPool<C>,entry:Option<PooledHTTP<C>> }
+type PoolPut<C> = { pool:HTTPPool<C>,evicted:Option<PooledHTTP<C>>,accepted:bool }
+fn http_pool_new<C>(capacity:i64,ttl:i64) -> HTTPPool<C>
+  = check capacity>=1 && capacity<=4096 && ttl>=0 in HTTPPool::<C> { entries=vec_empty::<PooledHTTP<C>>(),capacity=capacity,ttl=ttl }
+fn http_pool_take<C>(move pool:HTTPPool<C>,origin:Arr u8 _,now:i64) -> PoolTake<C>
+  = let found=loop(i=0,found= -1) while found<0 && i<vec_len(pool.entries) next(i+1,
+      match vec_get(pool.entries,i) { None => -1,Some(e) => if str_equal(e.origin,origin) && now>=e.idle_since && now-e.idle_since<=pool.ttl then i else -1 }) yield found in
+    let out=loop(i=0,items=vec_empty::<PooledHTTP<C>>()) while i<vec_len(pool.entries) next(i+1,
+      match vec_get(pool.entries,i) { None => items,Some(e) => if i==found then items else vec_push(items,e) }) yield items in
+    PoolTake::<C> { pool=pool with { entries=out },entry=vec_get(pool.entries,found) }
+fn http_pool_put<C>(move pool:HTTPPool<C>,entry:PooledHTTP<C>,reader:HttpReader) -> PoolPut<C>
+  = if !http_reader_reusable(reader) || len(entry.origin)==0 || entry.idle_since<0 then PoolPut::<C> { pool=pool,evicted=Some(entry),accepted=false } else
+    let full=vec_len(pool.entries)>=pool.capacity in let evicted=if full then vec_get(pool.entries,0) else None::<PooledHTTP<C>>() in
+    let items=loop(i=if full then 1 else 0,out=vec_empty::<PooledHTTP<C>>()) while i<vec_len(pool.entries) next(i+1,match vec_get(pool.entries,i) { None => out,Some(e) => vec_push(out,e) }) yield out in
+    PoolPut::<C> { pool=pool with { entries=vec_push(items,entry) },evicted=evicted,accepted=true }

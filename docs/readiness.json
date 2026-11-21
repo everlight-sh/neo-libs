@@ -1,0 +1,157 @@
+{
+  "format": 1,
+  "full_scope": "Text agent path plus a full realtime voice stack (Opus codec, WebRTC), Neo source only, Linux standalone runtime",
+  "full_scope_ready": false,
+  "capabilities": [
+    {
+      "id": "language-foundations",
+      "status": "implemented-profile",
+      "profile": "Generic callbacks, scoped resources, cancellation, kernel poll reactor, TCP/UDP, buffers; explicit cooperative tasks, no M:N scheduler",
+      "sources": [
+        "std:reactor",
+        "std:buffer"
+      ],
+      "tests": [
+        "tests/test_network.py"
+      ]
+    },
+    {
+      "id": "text-agent-path",
+      "status": "implemented-profile",
+      "profile": "One bounded Responses text/tool path with stdio MCP, continuation and durable snapshot",
+      "sources": [
+        "tests/agent_path.neo"
+      ],
+      "tests": [
+        "tests/test_agent_path.py"
+      ]
+    },
+    {
+      "id": "mcp-stdio",
+      "status": "implemented-profile",
+      "profile": "Sequential initialize/tools/list/tools/call/ping/notification profile",
+      "sources": [
+        "mcp/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_protocols.py"
+      ]
+    },
+    {
+      "id": "mcp-http",
+      "status": "missing",
+      "profile": "Streamable HTTP sessions, redirects, SSE reconnect/multiplexing",
+      "sources": [],
+      "tests": []
+    },
+    {
+      "id": "websocket-client",
+      "status": "implemented-profile",
+      "profile": "Live TCP/TLS, masking, fragmentation, control/close/deadline; no compression/subprotocol/reconnect",
+      "sources": [
+        "websocket/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_websocket_live.py"
+      ]
+    },
+    {
+      "id": "provider-coverage",
+      "status": "partial",
+      "profile": "Responses text/tools implemented; other provider adapters and live realtime sessions remain",
+      "sources": [
+        "providers/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_protocols.py"
+      ]
+    },
+    {
+      "id": "tls-pkix",
+      "status": "partial",
+      "profile": "TLS1.3 X25519/ChaCha20 SHA256 with RSA/P256 issuer chains; no broad cipher/group/PKIX/platform trust coverage",
+      "sources": [
+        "std:tls",
+        "std:p256"
+      ],
+      "tests": [
+        "tests/test_network.py",
+        "tests/test_websocket_live.py",
+        "tests/standalone.neo"
+      ]
+    },
+    {
+      "id": "audio-g711-rtp",
+      "status": "implemented-profile",
+      "profile": "PCM/G711, RTP wire/reorder compatibility; no broad recording/resampling engine",
+      "sources": [
+        "audio/src/lib.neo",
+        "rtp/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_media.py"
+      ]
+    },
+    {
+      "id": "opus-codec",
+      "status": "missing",
+      "profile": "Encoded packet framing exists; PCM encoder/decoder, SILK/CELT, PLC/FEC and conformance remain",
+      "sources": [
+        "opus-packet/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_media.py"
+      ]
+    },
+    {
+      "id": "stun-ice-turn",
+      "status": "partial",
+      "profile": "Authenticated STUN binding profile exists; ICE agent, gathering/checklist/nomination/consent/restart and TURN remain",
+      "sources": [
+        "stun/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_stun_udp.py"
+      ]
+    },
+    {
+      "id": "srtp-srtcp",
+      "status": "implemented-profile",
+      "profile": "AES_CM_128_HMAC_SHA1_80, KDR0, one SSRC/direction, replay and nonce protection",
+      "sources": [
+        "srtp/src/lib.neo"
+      ],
+      "tests": [
+        "tests/test_srtp.py"
+      ]
+    },
+    {
+      "id": "dtls-srtp",
+      "status": "missing",
+      "profile": "DTLS handshake, transcript, fingerprint authentication, retransmission and exporter/key establishment",
+      "sources": [],
+      "tests": []
+    },
+    {
+      "id": "sdp-sctp-webrtc",
+      "status": "missing",
+      "profile": "SDP negotiation, SCTP/data channels, PeerConnection orchestration and browser/provider interop",
+      "sources": [],
+      "tests": []
+    },
+    {
+      "id": "full-duplex-session",
+      "status": "missing",
+      "profile": "Persistent paced audio/control, backpressure, interruption, lifecycle/recovery and concurrent tools",
+      "sources": [],
+      "tests": []
+    },
+    {
+      "id": "production-security-readiness",
+      "status": "missing",
+      "profile": "Independent crypto/protocol review, wider interop and sustained adversarial/load validation",
+      "sources": [],
+      "tests": []
+    }
+  ]
+}

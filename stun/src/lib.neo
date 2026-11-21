@@ -1,0 +1,50 @@
+import "std:sha1"
+import "std:sha256"
+import "std:vec"
+import "std:errors"
+
+type STUNAttribute = { kind:i64,value:Arr u8 _,offset:i64 }
+sealed type STUNMessage = { ok:bool,kind:i64,transaction:Arr u8 _,attributes:Vec<STUNAttribute> }
+type STUNAddress = { ok:bool,host:Arr u8 _,port:i64 }
+private fn stun_u16(bytes:Arr u8 _,at:i64) -> i64 = str_byte(bytes,at)*256+str_byte(bytes,at+1)
+private fn stun_word(value:i64,width:i64) -> Arr u8 _
+  = check width>=0 && width<=4 in arr(i in 0..width) u8(bit_and(shift_right(value,(width-1-i)*8),255))
+fn stun_decode(bytes:Arr u8 n) -> STUNMessage
+  = let empty=STUNMessage { ok=false,kind=0,transaction="",attributes=vec_empty::<STUNAttribute>() } in
+    if n<20 || n>65555 || bit_and(str_byte(bytes,0),192)!=0 || !str_equal(str_slice(bytes,4,8),"\x21\x12\xa4\x42") || stun_u16(bytes,2)%4!=0 || stun_u16(bytes,2)!=n-20 then empty else
+    loop(at=20,attrs=vec_empty::<STUNAttribute>(),valid=true) while valid && at<n && vec_len(attrs)<128 next(
+      let length=stun_u16(bytes,at+2) in at+4+(length+3)/4*4,
+      let length=stun_u16(bytes,at+2) in vec_push(attrs,STUNAttribute { kind=stun_u16(bytes,at),value=str_slice(bytes,at+4,at+4+length),offset=at }),
+      let length=stun_u16(bytes,at+2) in at+4<=n && length>=0 && at+4+(length+3)/4*4<=n) yield
+      STUNMessage { ok=valid && at==n,kind=stun_u16(bytes,0),transaction=str_slice(bytes,8,20),attributes=attrs }
+fn stun_crc32(bytes:Arr u8 n) -> i64
+  = bit_xor(loop(i=0,crc=4294967295) while i<n next(i+1,
+      loop(j=0,v=bit_xor(crc,str_byte(bytes,i))) while j<8 next(j+1,bit_xor(shift_right(v,1),if bit_and(v,1)!=0 then 3988292384 else 0)) yield v) yield crc,4294967295)
+private fn stun_attribute(message:STUNMessage,kind:i64) -> STUNAttribute
+  = loop(i=0,result=STUNAttribute { kind=0,value="",offset= -1 }) while result.offset<0 && i<vec_len(message.attributes) next(i+1,
+      match vec_get(message.attributes,i) { None => result,Some(a) => if a.kind==kind then a else result }) yield result
+fn stun_verify_short_term(bytes:Arr u8 n,key:Arr u8 _,transaction:Arr u8 t) -> bool
+  = let message=stun_decode(bytes) in if !message.ok || len(key)<1 || len(key)>1024 || t!=12 || !crypto_equal(message.transaction,transaction) then false else
+    let integrity=stun_attribute(message,8) in let fingerprint=stun_attribute(message,32808) in
+    let valid=loop(i=0,mi=0,fp=0,valid=true) while valid && i<vec_len(message.attributes) next(i+1,
+      match vec_get(message.attributes,i) { None => mi,Some(a) => mi+(if a.kind==8 then 1 else 0) },
+      match vec_get(message.attributes,i) { None => fp,Some(a) => fp+(if a.kind==32808 then 1 else 0) },
+      match vec_get(message.attributes,i) { None => false,Some(a) => a.offset<=integrity.offset || a.kind==32808 }) yield valid && mi==1 && fp==1 in
+    if !valid || len(integrity.value)!=20 || len(fingerprint.value)!=4 || fingerprint.offset+8!=n || integrity.offset+24!=fingerprint.offset then false else
+    let authenticated=concat(str_slice(bytes,0,2),stun_word(integrity.offset+4,2),str_slice(bytes,4,integrity.offset)) in
+    crypto_equal(hmac_sha1(key,authenticated),integrity.value) && crypto_equal(stun_word(bit_xor(stun_crc32(str_slice(bytes,0,fingerprint.offset)),1398035790),4),fingerprint.value)
+private fn stun_header(kind:i64,length:i64,transaction:Arr u8 _) -> Arr u8 _
+  = concat(stun_word(kind,2),stun_word(length,2),"\x21\x12\xa4\x42",transaction)
+private fn stun_attr(kind:i64,value:Arr u8 n) -> Arr u8 _
+  = concat(stun_word(kind,2),stun_word(n,2),value,arr(i in 0..((4-n%4)%4)) u8(0))
+fn stun_binding_request(username:Arr u8 n,key:Arr u8 k,transaction:Arr u8 t,priority:i64,tiebreaker:Arr u8 b,controlling:bool,nominate:bool) -> BytesResult
+  = if n<1 || n>513 || k<1 || k>1024 || t!=12 || b!=8 || priority<1 || priority>4294967295 || nominate && !controlling then bytes_error(22,"invalid STUN binding request",0) else
+    let attributes=concat(stun_attr(6,username),stun_attr(36,stun_word(priority,4)),stun_attr(if controlling then 32810 else 32809,tiebreaker),if nominate then stun_attr(37,"") else "") in
+    let proof=hmac_sha1(key,concat(stun_header(1,len(attributes)+24,transaction),attributes)) in
+    let body=concat(attributes,stun_attr(8,proof)) in let wire=concat(stun_header(1,len(body)+8,transaction),body) in
+    bytes_ok(concat(wire,stun_attr(32808,stun_word(bit_xor(stun_crc32(wire),1398035790),4))))
+fn stun_xor_address(message:STUNMessage) -> STUNAddress
+  = let a=stun_attribute(message,32) in if !message.ok || len(a.value)!=8 || str_byte(a.value,0)!=0 || str_byte(a.value,1)!=1 then STUNAddress { ok=false,host="",port=0 } else
+    let cookie="\x21\x12\xa4\x42" in
+    STUNAddress { ok=true,port=bit_xor(stun_u16(a.value,2),8466),host=concat(
+      int_text(bit_xor(str_byte(a.value,4),str_byte(cookie,0))),".",int_text(bit_xor(str_byte(a.value,5),str_byte(cookie,1))),".",int_text(bit_xor(str_byte(a.value,6),str_byte(cookie,2))),".",int_text(bit_xor(str_byte(a.value,7),str_byte(cookie,3)))) }

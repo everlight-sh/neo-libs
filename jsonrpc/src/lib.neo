@@ -1,0 +1,37 @@
+import "std:json"
+
+; A transport-independent JSON-RPC 2.0 envelope. IDs retain their JSON type.
+; kind: 1 request, 2 notification, 3 successful reply, 4 error reply, 0 invalid.
+type RPCMessage = { ok:bool,kind:i64,id:Json,method:Arr u8 _,params:Json,result:Json,error:Json }
+private fn rpc_empty() -> RPCMessage
+  = RPCMessage { ok=false,kind=0,id=json_value_null(),method="",params=json_value_null(),result=json_value_null(),error=json_value_null() }
+private fn rpc_unique(doc:Json) -> bool
+  = let keys=json_object_keys(doc) in loop(i=0,valid=true) while valid && i<len(keys) next(i+1,
+    check i>=0 && i<len(keys) in loop(j=0,unique=true) while unique && j<i next(j+1,check j>=0 && j<len(keys) in !str_equal(keys[i],keys[j])) yield unique) yield valid
+fn rpc_decode(wire:Arr u8 n) -> RPCMessage
+  = let parsed=json_parse(wire) in let doc=parsed.value in let initial=rpc_empty() in
+    if !parsed.ok || doc.kind!=6 || !rpc_unique(doc) then initial else
+    let version=json_text(json_get(doc,"jsonrpc").value) in let id=json_get(doc,"id") in
+    let method=json_get(doc,"method") in let name=json_text(method.value) in
+    let params=json_get(doc,"params") in let result=json_get(doc,"result") in let error=json_get(doc,"error") in
+    let id_valid=!id.present || id.value.kind==1 || id.value.kind==3 || id.value.kind==4 in
+    if !version.ok || !str_equal(version.value,"2.0") || !id_valid then initial else
+    if method.present then
+      if !name.ok || len(name.value)==0 || id.present && id.value.kind==1 || result.present || error.present || params.present && params.value.kind!=5 && params.value.kind!=6 then initial else
+      initial with { ok=true,kind=if id.present then 1 else 2,id=if id.present then id.value else json_value_null(),method=name.value,params=if params.present then params.value else json_value_null() } else
+    if !id.present || result.present==error.present || params.present then initial else
+    if result.present then initial with { ok=true,kind=3,id=id.value,result=result.value } else
+      let code=json_int(json_get(error.value,"code").value) in let message=json_text(json_get(error.value,"message").value) in
+      if error.value.kind!=6 || !code.ok || !message.ok then initial else initial with { ok=true,kind=4,id=id.value,error=error.value }
+fn rpc_id_equal(a:Json,b:Json) -> bool
+  = a.kind==b.kind && (if a.kind==4 then str_equal(json_text(a).value,json_text(b).value) else if a.kind==3 then
+      let x=json_int(a) in let y=json_int(b) in x.ok && y.ok && x.value==y.value else a.kind==1 && b.kind==1)
+fn rpc_request(id:i64,method:Arr u8 n,params:Json) -> BytesResult
+  = if id<1 || n==0 || params.kind!=5 && params.kind!=6 then bytes_error(22,"invalid RPC request",0) else
+    bytes_ok(concat("{\"jsonrpc\":\"2.0\",\"id\":",int_text(id),",\"method\":",json_quote(method),",\"params\":",json_encode(params),"}"))
+fn rpc_notification(method:Arr u8 n,params:Json) -> BytesResult
+  = if n==0 || params.kind!=5 && params.kind!=6 then bytes_error(22,"invalid RPC notification",0) else
+    bytes_ok(concat("{\"jsonrpc\":\"2.0\",\"method\":",json_quote(method),",\"params\":",json_encode(params),"}"))
+fn rpc_result(id:Json,result:Json) -> BytesResult
+  = if id.kind!=1 && id.kind!=3 && id.kind!=4 || result.kind==0 then bytes_error(22,"invalid RPC result",0) else
+    bytes_ok(concat("{\"jsonrpc\":\"2.0\",\"id\":",json_encode(id),",\"result\":",json_encode(result),"}"))

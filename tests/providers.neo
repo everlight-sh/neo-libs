@@ -1,0 +1,19 @@
+import "std:vec"
+import "pkg:providers" as provider
+import "std:sse"
+import "std:json"
+import "std:io"
+private effect(fs) fn events(move state:provider::Responses,list:Vec<SSEEvent>) -> provider::Responses
+  = loop(i=0,current=state) while i<vec_len(list) next(i+1,
+    match vec_get(list,i) { None => current,Some(event) =>
+      let parsed=provider::responses_event(current,event) in
+      let output=loop(j=0) while j<vec_len(parsed.events) next(
+        match vec_get(parsed.events,j) { None => j+1,Some(item) =>
+          let printed=print_out(concat(item.kind," ",json_quote(item.text)," ",json_quote(item.call.id)," ",json_quote(item.call.arguments),"\n")) in j+1 }) yield j in
+      if parsed.ok then parsed.state else let failed=print_out(concat("error:",int_text(parsed.error.code),"\n")) in parsed.state }) yield current
+effect(fs,net,env,time,process) fn main() -> unit
+  = let raw=file_read(0,4194304) in check raw.ok in
+    let final=loop(i=0,sse=sse_new(),state=provider::responses_new()) while i<len(raw.value) next(i+1,
+      sse_feed(sse,str_slice(raw.value,i,i+1),1048576).state,
+      let step=sse_feed(sse,str_slice(raw.value,i,i+1),1048576) in check step.ok in events(state,step.events)) yield state in
+    let encoded=provider::responses_items(final) in let printed=print_out(concat("items ",json_encode(encoded),"\n")) in noop()

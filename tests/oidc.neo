@@ -1,0 +1,16 @@
+import "../oauth2/src/lib.neo"
+import "std:io"
+private effect(fs,net,time,process) fn oidc_peer(url:HTTPURL,method:Arr u8 n,headers:Arr HttpHeader h,body:Arr u8 m)->HttpResult
+  = let path=if str_equal(url.target,"/token") then
+      check str_equal(method,"POST") && str_equal(web_query_get(body,"code").value,"test-code") && len(web_query_get(body,"code_verifier").value)==43 in "token.json" else
+    if str_equal(url.target,"/jwks") then check str_equal(method,"GET") in "jwks.json" else
+    check str_equal(url.target,"/userinfo") && str_equal(method,"GET") && h==2 && str_equal(headers[0].value,"Bearer opaque-access-token") in "userinfo.json" in
+    let data=fs_read(path) in check data.ok in HttpResult {ok=true,status=200,body=data.value,error=no_error()}
+effect fn main(mode:i64)->unit
+  = let provider=oauth_oidc(oauth_provider("https://issuer.test/authorize","https://issuer.test/token","https://issuer.test/userinfo","test-client","http://127.0.0.1/callback","openid profile"),"https://issuer.test","https://issuer.test/jwks") in check provider.ok in
+    let key="test-oauth-key-at-least-32-bytes-long" in
+    if mode==0 then let start=oauth_begin(provider,key,2000000000000) in check start.ok in
+      let output=print_out(concat("{\"url\":",json_quote(start.url),",\"cookie\":",json_quote(start.cookie),"}\n")) in noop() else
+    let cookie=env_get("OIDC_COOKIE").value in let query=env_get("OIDC_QUERY").value in let callback=oauth_callback(provider,query,cookie,key,2000000000001) in
+    let identity=oauth_exchange(OAuthHTTP {request=function(oidc_peer)},provider,callback,"fixture-secret") in
+    let output=print_out(if identity.ok then concat("OK:",identity.issuer,"|",identity.subject,"\n") else concat("ERROR:",identity.error.message,"\n")) in noop()

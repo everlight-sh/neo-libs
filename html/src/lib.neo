@@ -1,0 +1,353 @@
+import "std:strings"
+import "std:vec"
+import "entities.neo"
+
+; HTML tokenizer (WHATWG 13.2.5): start and end tags with attributes (quoted,
+; unquoted, valueless; later duplicates dropped; names lowercased), text with
+; character references (decimal, hex with the Windows-1252 remap, and the full
+; WHATWG named table with longest-prefix matching), comments, doctypes with
+; public and system identifiers, processing instructions, bogus comments, raw
+; text (script data with its escaped states, style, xmp, iframe, noembed,
+; noframes), RCDATA (title, textarea), PLAINTEXT and, in foreign content, CDATA
+; sections. On its own it switches to raw text by tag name; a tree builder
+; (neo-dom) drives it in managed mode instead. Parse errors are not reported.
+; Every input is accepted; nothing traps.
+
+type HtmlAttribute = { name:Arr u8 _,value:Arr u8 _ }
+; kind: 1 text, 2 start tag, 3 end tag, 4 comment, 5 doctype, 7 processing
+; instruction (name is the target, text the data). A doctype's
+; public and system identifiers, when present, are attributes named "public"
+; and "system"; its self_closing field holds the force-quirks flag.
+type HtmlToken = { kind:i64,name:Arr u8 _,text:Arr u8 _,attributes:Arr HtmlAttribute _,self_closing:bool }
+; `managed`: a tree builder decides raw-text switching (it sets `raw` after a
+; start tag) instead of the tokenizer. `foreign`: the adjusted current node is
+; SVG or MathML, so "<![CDATA[" opens a CDATA section.
+; `orphan`: the raw-text element has no start tag in the input (a fragment's
+; context), so no end tag closes it.
+type HtmlScan = { at:i64,tokens:Vec<HtmlToken>,raw:Arr u8 _,managed:bool,foreign:bool,orphan:bool }
+type HtmlAttrScan = { at:i64,attributes:Arr HtmlAttribute _,self_closing:bool,done:bool,closed:bool }
+type HtmlRef = { length:i64,value:Arr u8 _ }
+type HtmlDecode = { run:i64,at:i64,out:Arr u8 _ }
+type HtmlComment = { at:i64,state:i64,out:Arr u8 _,done:bool }
+type HtmlId = { status:i64,value:Arr u8 _,at:i64 }
+type HtmlEmit = { at:i64,token:HtmlToken }
+
+fn html_alpha(c:i64) -> bool = c>=65 && c<=90 || c>=97 && c<=122
+fn html_digit(c:i64) -> bool = c>=48 && c<=57
+fn html_space(c:i64) -> bool = c==9 || c==10 || c==12 || c==13 || c==32
+fn html_ascii_lower(text:Arr u8 n) -> Arr u8 _
+  = arr(i in 0..n) if text[i]>='A' && text[i]<='Z' then u8(i64(text[i])+32) else text[i]
+fn html_no_attributes() -> Arr HtmlAttribute _ = arr(i in 0..0) HtmlAttribute { name="",value="" }
+fn html_attribute_new(name:Arr u8 n,value:Arr u8 m) -> HtmlAttribute = HtmlAttribute { name=name,value=value }
+fn html_token(kind:i64,name:Arr u8 n,text:Arr u8 m) -> HtmlToken
+  = HtmlToken { kind=kind,name=name,text=text,attributes=html_no_attributes(),self_closing=false }
+
+; First index at or after `from` holding byte b, or n.
+fn html_find_byte(text:Arr u8 n,from:i64,b:i64) -> i64
+  = loop(i=if from<0 then 0 else from) while i<n && str_byte(text,i)!=b next(i+1) yield if i>n then n else i
+fn html_find(text:Arr u8 n,from:i64,needle:Arr u8 m) -> i64
+  = if from<0 || from>n then -1 else let found=str_find(str_slice(text,from,n),needle) in if found.present then from+found.value else -1
+fn html_skip_space(text:Arr u8 n,from:i64) -> i64 = loop(i=from) while html_space(str_byte(text,i)) next(i+1) yield i
+fn html_starts_ci(text:Arr u8 n,at:i64,lower:Arr u8 m) -> bool
+  = loop(i=0,same=true) while same && i<m next(i+1,
+      let c=str_byte(text,at+i) in let folded=if c>=65 && c<=90 then c+32 else c in folded==str_byte(lower,i)) yield same
+
+; WHATWG 13.2.3.5: each CR LF pair and lone CR becomes LF before tokenizing.
+fn html_newline_step(state:HtmlDecode,text:Arr u8 n) -> HtmlDecode
+  = let run=state.at+(if str_byte(text,state.at+1)==10 then 2 else 1) in
+    HtmlDecode { run=run,at=html_find_byte(text,run,13),out=concat(state.out,str_slice(text,state.run,state.at),"\n") }
+fn html_newlines(text:Arr u8 n) -> Arr u8 _
+  = let first=html_find_byte(text,0,13) in if first>=n then text else
+    let done=loop(state=HtmlDecode { run=0,at=first,out="" }) while state.at<n next(html_newline_step(state,text)) yield state in
+    concat(done.out,str_slice(text,done.run,n))
+; U+0000 becomes U+FFFD in names, attribute values, comments, doctypes and raw text.
+fn html_nul_step(state:HtmlDecode,text:Arr u8 n) -> HtmlDecode
+  = HtmlDecode { run=state.at+1,at=html_find_byte(text,state.at+1,0),out=concat(state.out,str_slice(text,state.run,state.at),"\xef\xbf\xbd") }
+fn html_nul(text:Arr u8 n) -> Arr u8 _
+  = let first=html_find_byte(text,0,0) in if first>=n then text else
+    let done=loop(state=HtmlDecode { run=0,at=first,out="" }) while state.at<n next(html_nul_step(state,text)) yield state in
+    concat(done.out,str_slice(text,done.run,n))
+
+; Character references. Unknown names and malformed numbers stay literal text.
+; Named references: binary search over the generated WHATWG table (entities.neo).
+type HtmlSearch = { low:i64,high:i64,found:i64 }
+type HtmlMatch = { entry:i64,length:i64 }
+fn html_entity_start(index:Arr u8 n,entry:i64,field:i64) -> i64
+  = str_byte(index,4*entry+2*field)+256*str_byte(index,4*entry+2*field+1)
+; Bytewise order of text[from, from+length) against names[start, end).
+fn html_entity_compare(text:Arr u8 n,from:i64,length:i64,names:Arr u8 m,start:i64,end:i64) -> i64
+  = loop(i=0,order=0) while order==0 && i<length && start+i<end
+      next(i+1,str_byte(text,from+i)-str_byte(names,start+i)) yield if order!=0 then order else length-(end-start)
+fn html_entity_step(search:HtmlSearch,text:Arr u8 n,from:i64,length:i64,names:Arr u8 m,index:Arr u8 k) -> HtmlSearch
+  = let middle=(search.low+search.high)/2 in
+    let order=html_entity_compare(text,from,length,names,html_entity_start(index,middle,0),html_entity_start(index,middle+1,0)) in
+    if order==0 then search with { found=middle } else if order<0 then search with { high=middle } else search with { low=middle+1 }
+; The entry named exactly text[from, from+length), or -1.
+fn html_entity_find(text:Arr u8 n,from:i64,length:i64) -> i64
+  = let names=html_entity_names() in let index=html_entity_index() in
+    let done=loop(search=HtmlSearch { low=0,high=html_entity_count(),found=-1 }) while search.found<0 && search.low<search.high
+      next(html_entity_step(search,text,from,length,names,index)) yield search in
+    done.found
+fn html_entity_value(entry:i64) -> Arr u8 _
+  = let index=html_entity_index() in str_slice(html_entity_values(),html_entity_start(index,entry,1),html_entity_start(index,entry+1,1))
+; The longest table name that prefixes text[from, from+longest), at least two bytes long.
+fn html_entity_prefix(text:Arr u8 n,from:i64,longest:i64) -> HtmlMatch
+  = loop(length=longest,entry=-1) while entry<0 && length>=2 next(length-1,html_entity_find(text,from,length))
+      yield HtmlMatch { entry=entry,length=length+1 }
+; Numeric references 128..159 name Windows-1252 characters (WHATWG 13.2.5.80).
+fn html_c1(code:i64) -> i64
+  = if code==128 then 8364 else if code==130 then 8218 else if code==131 then 402 else if code==132 then 8222 else if code==133 then 8230
+    else if code==134 then 8224 else if code==135 then 8225 else if code==136 then 710 else if code==137 then 8240 else if code==138 then 352
+    else if code==139 then 8249 else if code==140 then 338 else if code==142 then 381 else if code==145 then 8216 else if code==146 then 8217
+    else if code==147 then 8220 else if code==148 then 8221 else if code==149 then 8226 else if code==150 then 8211 else if code==151 then 8212
+    else if code==152 then 732 else if code==153 then 8482 else if code==154 then 353 else if code==155 then 8250 else if code==156 then 339
+    else if code==158 then 382 else if code==159 then 376 else code
+fn html_codepoint(code:i64) -> Arr u8 _
+  = let fixed=if code==0 || code>1114111 || code>=55296 && code<=57343 then 65533 else html_c1(code) in
+    let encoded=utf8_encode(fixed) in if encoded.ok then encoded.value else "\xef\xbf\xbd"
+fn html_hex(c:i64) -> i64
+  = if c>=48 && c<=57 then c-48 else if c>=97 && c<=102 then c-87 else if c>=65 && c<=70 then c-55 else -1
+type HtmlNumber = { at:i64,value:i64 }
+fn html_number(text:Arr u8 n,from:i64,hex:bool) -> HtmlNumber
+  = loop(at=from,value=0) while (if hex then html_hex(str_byte(text,at))>=0 else html_digit(str_byte(text,at)))
+      next(at+1,if value>1114111 then value else value*(if hex then 16 else 10)+(if hex then html_hex(str_byte(text,at)) else str_byte(text,at)-48))
+      yield HtmlNumber { at=at,value=value }
+fn html_reference(text:Arr u8 n,at:i64,attribute:bool) -> HtmlRef
+  = let c=str_byte(text,at+1) in
+    if c==35 then
+      let hex=str_byte(text,at+2)==120 || str_byte(text,at+2)==88 in let start=if hex then at+3 else at+2 in
+      let number=html_number(text,start,hex) in
+      if number.at==start then HtmlRef { length=1,value="&" } else
+        HtmlRef { length=number.at-at+(if str_byte(text,number.at)==59 then 1 else 0),value=html_codepoint(number.value) }
+    else if html_alpha(c) then
+      ; WHATWG 13.2.5.73: consume the longest name in the table. Only the full
+      ; alphanumeric run can end in ';'; shorter prefixes match legacy names.
+      let end=loop(i=at+1) while i<n && i-at<=32 && (html_alpha(str_byte(text,i)) || html_digit(str_byte(text,i))) next(i+1) yield i in
+      let full=if str_byte(text,end)==59 then html_entity_find(text,at+1,end-at) else -1 in
+      if full>=0 then HtmlRef { length=end-at+1,value=html_entity_value(full) } else
+      let legacy=html_entity_prefix(text,at+1,end-at-1) in
+      let following=str_byte(text,at+1+legacy.length) in
+      if legacy.entry<0 || attribute && (following==61 || html_alpha(following) || html_digit(following)) then HtmlRef { length=1,value="&" }
+      else HtmlRef { length=legacy.length+1,value=html_entity_value(legacy.entry) }
+    else HtmlRef { length=1,value="&" }
+fn html_decode_step(state:HtmlDecode,text:Arr u8 n,attribute:bool) -> HtmlDecode
+  = let reference=html_reference(text,state.at,attribute) in let after=state.at+reference.length in
+    HtmlDecode { run=after,at=html_find_byte(text,after,38),out=concat(state.out,str_slice(text,state.run,state.at),reference.value) }
+; Text with its character references replaced; text without '&' is returned as is.
+fn html_decode(text:Arr u8 n,attribute:bool) -> Arr u8 _
+  = let first=html_find_byte(text,0,38) in if first>=n then text else
+    let done=loop(state=HtmlDecode { run=0,at=first,out="" }) while state.at<n next(html_decode_step(state,text,attribute)) yield state in
+    concat(done.out,str_slice(text,done.run,n))
+
+; Elements whose content is not markup until their end tag.
+fn html_rawtext(name:Arr u8 n) -> bool
+  = str_equal(name,"script") || str_equal(name,"style") || str_equal(name,"xmp") || str_equal(name,"iframe")
+    || str_equal(name,"noembed") || str_equal(name,"noframes")
+fn html_rcdata(name:Arr u8 n) -> bool = str_equal(name,"title") || str_equal(name,"textarea")
+fn html_name_end(text:Arr u8 n,from:i64) -> i64
+  = loop(i=from) while i<n && !html_space(str_byte(text,i)) && str_byte(text,i)!=47 && str_byte(text,i)!=62 next(i+1) yield i
+fn html_attribute_name_end(text:Arr u8 n,from:i64) -> i64
+  = loop(i=from) while i<n && !html_space(str_byte(text,i)) && str_byte(text,i)!=47 && str_byte(text,i)!=62 && str_byte(text,i)!=61 next(i+1) yield i
+fn html_unquoted_end(text:Arr u8 n,from:i64) -> i64
+  = loop(i=from) while i<n && !html_space(str_byte(text,i)) && str_byte(text,i)!=62 next(i+1) yield i
+fn html_has_attribute(attributes:Arr HtmlAttribute n,name:Arr u8 m) -> bool
+  = loop(i=0,found=false) while !found && i<n next(i+1,check i>=0 && i<n in str_equal(attributes[i].name,name)) yield found
+; One attribute, or the tag's end. Every step consumes at least one byte.
+fn html_attribute_step(scan:HtmlAttrScan,text:Arr u8 n) -> HtmlAttrScan
+  = let at=html_skip_space(text,scan.at) in let c=str_byte(text,at) in
+    if c<0 then scan with { at=n,done=true } else
+    if c==62 then scan with { at=at+1,done=true,closed=true } else
+    if c==47 then (if str_byte(text,at+1)==62 then scan with { at=at+2,self_closing=true,done=true,closed=true } else scan with { at=at+1 }) else
+    let name_end=html_attribute_name_end(text,at+1) in let name=html_nul(html_ascii_lower(str_slice(text,at,name_end))) in
+    let after=html_skip_space(text,name_end) in let valued=str_byte(text,after)==61 in
+    let start=if valued then html_skip_space(text,after+1) else after in let quote=str_byte(text,start) in
+    let quoted=valued && (quote==34 || quote==39) in
+    let end=if !valued then start else if quoted then html_find_byte(text,start+1,quote) else html_unquoted_end(text,start) in
+    let raw=if !valued then "" else if quoted then str_slice(text,start+1,end) else str_slice(text,start,end) in
+    let resume=if !valued then after else if quoted then (if end<n then end+1 else n) else end in
+    scan with { at=resume,attributes=if html_has_attribute(scan.attributes,name) then scan.attributes
+      else push(scan.attributes,HtmlAttribute { name=name,value=html_decode(html_nul(raw),true) }) }
+
+fn html_bogus(move state:HtmlScan,text:Arr u8 n,from:i64) -> HtmlScan
+  = let close=html_find_byte(text,from,62) in
+    state with { at=if close<n then close+1 else n,tokens=vec_push(state.tokens,html_token(4,"",html_nul(str_slice(text,from,close)))),raw="" }
+; WHATWG 13.2.5.43-52, from after "<!--". States: 0 start, 1 start dash, 2 data,
+; 3 end dash, 4 end, 5 end bang. The less-than-sign states only report errors,
+; so they are folded into the data state. End of input emits the comment.
+fn html_comment_data_end(text:Arr u8 n,from:i64) -> i64
+  = loop(i=from) while i<n && str_byte(text,i)!=45 && str_byte(text,i)!=0 next(i+1) yield i
+fn html_comment_step(scan:HtmlComment,text:Arr u8 n) -> HtmlComment
+  = let c=str_byte(text,scan.at) in let at=scan.at in
+    if c<0 then scan with { at=n,done=true } else
+    if scan.state==0 then (if c==45 then scan with { at=at+1,state=1 } else if c==62 then scan with { at=at+1,done=true } else scan with { state=2 })
+    else if scan.state==1 then (if c==45 then scan with { at=at+1,state=4 } else if c==62 then scan with { at=at+1,done=true }
+      else scan with { out=concat(scan.out,"-"),state=2 })
+    else if scan.state==2 then
+      (if c==45 then scan with { at=at+1,state=3 } else if c==0 then scan with { at=at+1,out=concat(scan.out,"\xef\xbf\xbd") }
+       else let end=html_comment_data_end(text,at) in scan with { at=end,out=concat(scan.out,str_slice(text,at,end)) })
+    else if scan.state==3 then (if c==45 then scan with { at=at+1,state=4 } else scan with { out=concat(scan.out,"-"),state=2 })
+    else if scan.state==4 then
+      (if c==62 then scan with { at=at+1,done=true } else if c==33 then scan with { at=at+1,state=5 }
+       else if c==45 then scan with { at=at+1,out=concat(scan.out,"-") } else scan with { out=concat(scan.out,"--"),state=2 })
+    else if c==45 then scan with { at=at+1,out=concat(scan.out,"--!"),state=3 }
+    else if c==62 then scan with { at=at+1,done=true } else scan with { out=concat(scan.out,"--!"),state=2 }
+fn html_comment(text:Arr u8 n,from:i64) -> HtmlEmit
+  = let done=loop(scan=HtmlComment { at=from,state=0,out="",done=false }) while !scan.done next(html_comment_step(scan,text)) yield scan in
+    HtmlEmit { at=done.at,token=html_token(4,"",done.out) }
+
+; Doctypes (WHATWG 13.2.5.53-68), from after "<!DOCTYPE".
+fn html_doctype_token(name:Arr u8 n,ids:Arr HtmlAttribute m,quirks:bool) -> HtmlToken
+  = HtmlToken { kind=5,name=name,text="",attributes=ids,self_closing=quirks }
+fn html_doctype_ids(public:Arr u8 n,has_public:bool,system:Arr u8 m,has_system:bool) -> Arr HtmlAttribute _
+  = let first=if has_public then push(html_no_attributes(),HtmlAttribute { name="public",value=public }) else html_no_attributes() in
+    if has_system then push(first,HtmlAttribute { name="system",value=system }) else first
+; Bogus doctype state: everything up to and including the next '>'.
+fn html_doctype_skip(text:Arr u8 n,from:i64) -> i64 = let close=html_find_byte(text,from,62) in if close<n then close+1 else n
+fn html_doctype_name_end(text:Arr u8 n,from:i64) -> i64
+  = loop(i=from) while i<n && !html_space(str_byte(text,i)) && str_byte(text,i)!=62 next(i+1) yield i
+; An identifier after optional spaces. status: 0 closed by its quote; 1 cut off
+; by '>'; 2 cut off by the end of input; 3 missing before '>'; 4 missing at the
+; end of input; 5 missing before other text (a bogus doctype follows).
+fn html_doctype_id(text:Arr u8 n,from:i64) -> HtmlId
+  = let at=html_skip_space(text,from) in let quote=str_byte(text,at) in
+    if quote==34 || quote==39 then
+      let end=loop(i=at+1) while i<n && str_byte(text,i)!=quote && str_byte(text,i)!=62 next(i+1) yield i in
+      let value=html_nul(str_slice(text,at+1,end)) in
+      if end>=n then HtmlId { status=2,value=value,at=n } else HtmlId { status=if str_byte(text,end)==quote then 0 else 1,value=value,at=end+1 }
+    else if quote==62 then HtmlId { status=3,value="",at=at+1 }
+    else if quote<0 then HtmlId { status=4,value="",at=n }
+    else HtmlId { status=5,value="",at=at }
+fn html_doctype_end(id:HtmlId,text:Arr u8 n) -> i64 = if id.status==5 then html_doctype_skip(text,id.at) else id.at
+; After the system identifier: '>' ends the doctype; other text is bogus but not quirky.
+fn html_doctype_close(text:Arr u8 n,from:i64,name:Arr u8 m,ids:Arr HtmlAttribute k) -> HtmlEmit
+  = let at=html_skip_space(text,from) in let c=str_byte(text,at) in
+    if c==62 then HtmlEmit { at=at+1,token=html_doctype_token(name,ids,false) }
+    else if c<0 then HtmlEmit { at=n,token=html_doctype_token(name,ids,true) }
+    else HtmlEmit { at=html_doctype_skip(text,at),token=html_doctype_token(name,ids,false) }
+fn html_doctype_system(text:Arr u8 n,from:i64,name:Arr u8 m,public:Arr u8 k,has_public:bool) -> HtmlEmit
+  = let id=html_doctype_id(text,from) in let ids=html_doctype_ids(public,has_public,id.value,id.status<=2) in
+    if id.status==0 then html_doctype_close(text,id.at,name,ids) else HtmlEmit { at=html_doctype_end(id,text),token=html_doctype_token(name,ids,true) }
+fn html_doctype_public(text:Arr u8 n,from:i64,name:Arr u8 m) -> HtmlEmit
+  = let id=html_doctype_id(text,from) in
+    if id.status!=0 then HtmlEmit { at=html_doctype_end(id,text),token=html_doctype_token(name,html_doctype_ids(id.value,id.status<=2,"",false),true) } else
+    let at=html_skip_space(text,id.at) in let c=str_byte(text,at) in
+    if c==62 then HtmlEmit { at=at+1,token=html_doctype_token(name,html_doctype_ids(id.value,true,"",false),false) }
+    else if c<0 then HtmlEmit { at=n,token=html_doctype_token(name,html_doctype_ids(id.value,true,"",false),true) }
+    else if c==34 || c==39 then html_doctype_system(text,at,name,id.value,true)
+    else HtmlEmit { at=html_doctype_skip(text,at),token=html_doctype_token(name,html_doctype_ids(id.value,true,"",false),true) }
+fn html_doctype(text:Arr u8 n,from:i64) -> HtmlEmit
+  = let start=html_skip_space(text,from) in let c=str_byte(text,start) in
+    if c<0 then HtmlEmit { at=n,token=html_doctype_token("",html_no_attributes(),true) } else
+    if c==62 then HtmlEmit { at=start+1,token=html_doctype_token("",html_no_attributes(),true) } else
+    let name_end=html_doctype_name_end(text,start) in let name=html_nul(html_ascii_lower(str_slice(text,start,name_end))) in
+    let after=html_skip_space(text,name_end) in let d=str_byte(text,after) in
+    if d<0 then HtmlEmit { at=n,token=html_doctype_token(name,html_no_attributes(),true) } else
+    if d==62 then HtmlEmit { at=after+1,token=html_doctype_token(name,html_no_attributes(),false) } else
+    if html_starts_ci(text,after,"public") then html_doctype_public(text,after+6,name) else
+    if html_starts_ci(text,after,"system") then html_doctype_system(text,after+6,name,"",false) else
+    HtmlEmit { at=html_doctype_skip(text,after),token=html_doctype_token(name,html_no_attributes(),true) }
+
+; Processing instructions (WHATWG 13.2.5.72-76), from just after "<?". An invalid
+; or reserved target makes a bogus comment that starts at the '?'; end of input
+; inside one emits nothing.
+fn html_pi_name(c:i64) -> bool = html_alpha(c) || html_digit(c) || c==45 || c==95
+fn html_pi(move state:HtmlScan,text:Arr u8 n,from:i64) -> HtmlScan
+  = let first=str_byte(text,from) in
+    if first<0 then state with { at=n } else
+    if !html_alpha(first) && first!=95 then html_bogus(state,text,from-1) else
+    let end=loop(i=from) while i<n && html_pi_name(str_byte(text,i)) next(i+1) yield i in
+    let c=str_byte(text,end) in
+    if c<0 then state with { at=n } else
+    let target=str_slice(text,from,end) in let lower=html_ascii_lower(target) in
+    if !(html_space(c) || c==63 || c==62) || str_equal(lower,"xml") || str_equal(lower,"xml-stylesheet") then html_bogus(state,text,from-1) else
+    let start=html_skip_space(text,end) in let close=html_find_byte(text,start,62) in
+    if close>=n then state with { at=n } else
+    let stop=if close>start && str_byte(text,close-1)==63 then close-1 else close in
+    state with { at=close+1,tokens=vec_push(state.tokens,html_token(7,target,str_slice(text,start,stop))),raw="" }
+fn html_markup(move state:HtmlScan,text:Arr u8 n) -> HtmlScan
+  = let at=state.at in
+    if bytes_match_at(text,at,"<!--") then let found=html_comment(text,at+4) in state with { at=found.at,tokens=vec_push(state.tokens,found.token),raw="" }
+    else if html_starts_ci(text,at+2,"doctype") then let found=html_doctype(text,at+9) in state with { at=found.at,tokens=vec_push(state.tokens,found.token),raw="" }
+    else if state.foreign && bytes_match_at(text,at,"<![CDATA[") then
+      let end=html_find(text,at+9,"]]>") in let stop=if end<0 then n else end in
+      state with { at=if end<0 then n else end+3,tokens=if stop==at+9 then state.tokens else vec_push(state.tokens,html_token(1,"",str_slice(text,at+9,stop))),raw="" }
+    else html_bogus(state,text,at+2)
+fn html_tag_attributes(text:Arr u8 n,from:i64) -> HtmlAttrScan
+  = loop(scan=HtmlAttrScan { at=from,attributes=html_no_attributes(),self_closing=false,done=false,closed=false }) while !scan.done
+      next(html_attribute_step(scan,text)) yield scan
+; A tag cut off by the end of input is dropped (eof-in-tag).
+fn html_start_tag(move state:HtmlScan,text:Arr u8 n) -> HtmlScan
+  = let name_end=html_name_end(text,state.at+1) in let name=html_nul(html_ascii_lower(str_slice(text,state.at+1,name_end))) in
+    let tag=html_tag_attributes(text,name_end) in
+    if !tag.closed then state with { at=n } else
+    state with { at=tag.at,tokens=vec_push(state.tokens,HtmlToken { kind=2,name=name,text="",attributes=tag.attributes,self_closing=tag.self_closing }),
+      raw=if !state.managed && (html_rawtext(name) || html_rcdata(name) || str_equal(name,"plaintext")) then name else "" }
+fn html_end_tag(move state:HtmlScan,text:Arr u8 n) -> HtmlScan
+  = let at=state.at in let c=str_byte(text,at+2) in
+    if html_alpha(c) then
+      let name_end=html_name_end(text,at+2) in let tag=html_tag_attributes(text,name_end) in
+      if !tag.closed then state with { at=n } else
+      state with { at=tag.at,tokens=vec_push(state.tokens,html_token(3,html_nul(html_ascii_lower(str_slice(text,at+2,name_end))),"")),raw="" }
+    else if c==62 then state with { at=at+3 }
+    else if c<0 then state with { at=n,tokens=vec_push(state.tokens,html_token(1,"","</")),raw="" }
+    else html_bogus(state,text,at+2)
+; The end of a raw-text or RCDATA element: "</name" followed by space, '/' or '>' (any case).
+fn html_raw_end(text:Arr u8 n,from:i64,name:Arr u8 m) -> i64
+  = loop(at=html_find(text,from,"</"),found=-1) while found<0 && at>=0
+      next(html_find(text,at+2,"</"),
+        let after=str_byte(text,at+2+m) in
+        if html_starts_ci(text,at+2,name) && (html_space(after) || after==47 || after==62) then at else -1)
+      yield if found<0 then n else found
+; Script data (WHATWG 13.2.5.4 and 13.2.5.15-32): inside "<!--", a "<script"
+; opens a double-escaped section in which "</script" does not end the element.
+; states: 0 script data, 1 escaped, 2 double escaped.
+type HtmlScript = { at:i64,state:i64,end:i64 }
+fn html_script_tag(text:Arr u8 n,at:i64) -> bool
+  = html_starts_ci(text,at,"script") && (let c=str_byte(text,at+6) in html_space(c) || c==47 || c==62)
+fn html_script_step(scan:HtmlScript,text:Arr u8 n) -> HtmlScript
+  = let at=scan.at in
+    if scan.state==0 then
+      let lt=html_find_byte(text,at,60) in
+      if lt>=n then scan with { at=n,end=n }
+      else if str_byte(text,lt+1)==47 && html_script_tag(text,lt+2) then scan with { end=lt }
+      else if bytes_match_at(text,lt,"<!--") then scan with { at=lt+2,state=1 }
+      else scan with { at=lt+1 }
+    else if bytes_match_at(text,at,"-->") then scan with { at=at+3,state=0 }
+    else if str_byte(text,at)==60 && str_byte(text,at+1)==47 && html_script_tag(text,at+2) then
+      (if scan.state==1 then scan with { end=at } else scan with { at=at+8,state=1 })
+    else if scan.state==1 && str_byte(text,at)==60 && html_script_tag(text,at+1) then scan with { at=at+7,state=2 }
+    else if at>=n then scan with { end=n }
+    else scan with { at=at+1 }
+fn html_script_end(text:Arr u8 n,from:i64) -> i64
+  = let done=loop(scan=HtmlScript { at=from,state=0,end=-1 }) while scan.end<0 next(html_script_step(scan,text)) yield scan in done.end
+fn html_raw_step(move state:HtmlScan,text:Arr u8 n) -> HtmlScan
+  = let end=if state.orphan || str_equal(state.raw,"plaintext") then n
+      else if str_equal(state.raw,"script") then html_script_end(text,state.at) else html_raw_end(text,state.at,state.raw) in
+    let content=html_nul(str_slice(text,state.at,end)) in
+    state with { at=end,tokens=if end==state.at then state.tokens else vec_push(state.tokens,html_token(1,state.raw,if html_rcdata(state.raw) then html_decode(content,false) else content)),raw="" }
+fn html_step(move state:HtmlScan,text:Arr u8 n) -> HtmlScan
+  = if len(state.raw)>0 then html_raw_step(state,text) else
+    let at=state.at in
+    if str_byte(text,at)!=60 then
+      let stop=html_find_byte(text,at+1,60) in
+      state with { at=stop,tokens=vec_push(state.tokens,html_token(1,"",html_decode(str_slice(text,at,stop),false))),raw="" }
+    else
+      let c=str_byte(text,at+1) in
+      if c==33 then html_markup(state,text)
+      else if c==47 then html_end_tag(state,text)
+      else if c==63 then html_pi(state,text,at+2)
+      else if html_alpha(c) then html_start_tag(state,text)
+      else state with { at=at+1,tokens=vec_push(state.tokens,html_token(1,"","<")),raw="" }
+fn html_scan(managed:bool) -> HtmlScan = HtmlScan { at=0,tokens=vec_empty::<HtmlToken>(),raw="",managed=managed,foreign=false,orphan=false }
+; WHATWG 13.2.3.5 input preprocessing; tree builders tokenize its result.
+fn html_input(text:Arr u8 n) -> Arr u8 _ = html_newlines(text)
+; The document's tokens in order. Text inside raw-text and RCDATA elements is a
+; text token whose `name` is that element.
+fn html_tokens(input:Arr u8 n) -> Arr HtmlToken _
+  = let text=html_newlines(input) in
+    let done=loop(state=html_scan(false)) while state.at<len(text) next(html_step(state,text)) yield state in
+    let tokens=done.tokens in let count=vec_len(tokens) in
+    check count>=0 in arr(i in 0..count) match vec_get(tokens,i) { Some(token)=>token,None=>html_token(0,"","") }
+fn html_attribute(token:HtmlToken,name:Arr u8 n) -> OptionBytes
+  = loop(i=0,found=none_bytes()) while !found.present && i<len(token.attributes)
+      next(i+1,check i>=0 && i<len(token.attributes) in if str_equal(token.attributes[i].name,name) then some_bytes(token.attributes[i].value) else found) yield found

@@ -1,0 +1,10 @@
+import "std:p256"
+import "std:aes"
+import "std:sha1"
+fn main() -> Arr u8 _
+  = let public=p256_public(arr(i in 0..32) u8(if i==31 then 1 else 0)) in check public.ok && len(public.value)==65 in
+    let sig=ecdsa_p256_sign_sha256(arr(i in 0..32) u8(if i==31 then 1 else 0),"standalone") in
+    check sig.ok && ecdsa_p256_verify_sha256(public.value,"standalone",sig.value) in
+    let ciphertext=aes128_gcm_seal(arr(i in 0..16) u8(0),arr(i in 0..12) u8(0),"","Neo") in check ciphertext.ok in
+    let plaintext=aes128_gcm_open(arr(i in 0..16) u8(0),arr(i in 0..12) u8(0),"",ciphertext.value) in check plaintext.ok && str_equal(plaintext.value,"Neo") in
+    check crypto_equal(sha1("abc"),"\xa9\x99\x3e\x36\x47\x06\x81\x6a\xba\x3e\x25\x71\x78\x50\xc2\x6c\x9c\xd0\xd8\x9d") in "crypto OK\n"

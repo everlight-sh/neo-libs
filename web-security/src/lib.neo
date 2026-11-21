@@ -1,0 +1,101 @@
+import "std:http_server"
+import "std:sha256"
+import "std:base64"
+import "std:random"
+import "std:fs"
+import "std:pbkdf2"
+
+; Signed, expiring sessions. Identity verification belongs to the application.
+; Tokens are v2.subject.csrf.issued.expiry.signature (base64url subject and CSRF
+; nonce, millisecond times, HMAC-SHA256). v1 tokens, which have no issue time,
+; still verify and count as issued at 0, so any revocation ends them.
+sealed type WebSession = { authenticated:bool,subject:Arr u8 _,csrf:Arr u8 _,issued:i64,expires:i64 }
+fn web_session_none() -> WebSession = WebSession { authenticated=false,subject="",csrf="",issued=0,expires=0 }
+private fn session_piece(token:Arr u8 n,index:i64) -> Arr u8 _
+  = loop(at=0,part=0,out="") while at<=n && part<=index
+      next(let end=str_find(str_slice(token,at,n),".") in if end.present then at+end.value+1 else n+1,part+1,
+        if part==index then let end=str_find(str_slice(token,at,n),".") in str_slice(token,at,if end.present then at+end.value else n) else out) yield out
+fn web_session_verify(token:Arr u8 n,key:Arr u8 m,now:i64) -> WebSession
+  = if n>2048 || m<32 || now<=0 then web_session_none() else
+    let version=session_piece(token,0) in let v2=str_equal(version,"v2") in
+    let subject=session_piece(token,1) in let csrf=session_piece(token,2) in
+    let issued=if v2 then session_piece(token,3) else "0" in
+    let expiry=session_piece(token,if v2 then 4 else 3) in let signature=session_piece(token,if v2 then 5 else 4) in
+    let payload=if v2 then concat(version,".",subject,".",csrf,".",issued,".",expiry) else concat(version,".",subject,".",csrf,".",expiry) in
+    let decoded=base64url_decode(subject) in let nonce=base64url_decode(csrf) in let issued_at=int_parse(issued) in let expires=int_parse(expiry) in
+    if !(v2 || str_equal(version,"v1")) || !str_equal(token,concat(payload,".",signature)) || !decoded.ok || len(decoded.value)<1 || len(decoded.value)>256 || !utf8_valid(decoded.value) || !nonce.ok || len(nonce.value)!=32 || !expires.ok || expires.value<=now || expires.value-now>2592000000 || !issued_at.ok || issued_at.value<0 || issued_at.value>=expires.value || v2 && issued_at.value<1 || !crypto_equal(signature,base64url_encode(hmac_sha256(key,payload)))
+    then web_session_none() else WebSession { authenticated=true,subject=decoded.value,csrf=csrf,issued=issued_at.value,expires=expires.value }
+effect(process) fn web_session_create(subject:Arr u8 n,key:Arr u8 m,now:i64,lifetime:i64) -> BytesResult
+  = if n<1 || n>256 || !utf8_valid(subject) || m<32 || now<=0 || lifetime<1 || lifetime>2592000000 || now>9223372036854775807-lifetime then bytes_error(22,"invalid session configuration",0) else
+    let nonce=random_bytes(32) in if !nonce.ok then nonce else
+      let payload=concat("v2.",base64url_encode(subject),".",base64url_encode(nonce.value),".",int_text(now),".",int_text(now+lifetime)) in
+      bytes_ok(concat(payload,".",base64url_encode(hmac_sha256(key,payload))))
+
+; Revocation keeps one small file per subject in an application-owned
+; directory, holding the time before which that subject's sessions are invalid.
+private fn session_revocation_path(directory:Arr u8 n,subject:Arr u8 m) -> Arr u8 _
+  = concat(directory,"/",base64url_encode(sha256(subject)))
+; Ends every session of `subject` issued before `now`. Call it at logout and on
+; a password change; a session created afterwards, even in the same millisecond,
+; stays valid. The stored time never moves backwards.
+effect(fs,process) fn web_session_revoke(directory:Arr u8 n,subject:Arr u8 m,now:i64) -> IntResult
+  = if !io_path_valid(directory) || m<1 || m>256 || now<=0 then int_error(22,"invalid session revocation",0) else
+    let made=fs_mkdir(directory) in let path=session_revocation_path(directory,subject) in
+    let previous=fs_read(path) in let before=int_parse(previous.value) in
+    if !previous.ok && previous.error.code!=2 then int_error(previous.error.code,previous.error.message,0) else
+    if previous.ok && before.ok && before.value>=now then int_ok(0) else fs_atomic_replace(path,int_text(now))
+; The session, or none when it was revoked. A missing file means never revoked;
+; any other read error or an invalid directory fails closed.
+effect(fs) fn web_session_current(session:WebSession,directory:Arr u8 n) -> WebSession
+  = if !session.authenticated then session else if !io_path_valid(directory) then web_session_none() else
+    let raw=fs_read(session_revocation_path(directory,session.subject)) in
+    if !raw.ok then (if raw.error.code==2 then session else web_session_none()) else
+    let after=int_parse(raw.value) in if !after.ok || session.issued<after.value then web_session_none() else session
+; The request's verified session cookie, checked against the revocation directory.
+effect(fs) fn web_session_read(request:WebRequest,key:Arr u8 n,directory:Arr u8 m) -> WebSession
+  = web_session_current(web_session_verify(web_cookie(request,"neokit_session").value,key,request.stamp),directory)
+fn web_csrf(request:WebRequest,session:WebSession,origin:Arr u8 n) -> bool
+  = !web_mutation(request) || session.authenticated && web_same_origin(request,origin) &&
+    crypto_equal(session.csrf,let header=web_request_header(request,"x-csrf-token") in if len(header)>0 then header else web_form(request,"_csrf").value)
+fn web_session_cookie(response:WebResponse,token:Arr u8 n,lifetime_seconds:i64,secure:bool) -> WebResponse
+  = web_set_cookie(response,"neokit_session",token,lifetime_seconds,secure)
+
+; Storage format p1.rounds.base64url(salt).base64url(derived-key).
+effect(process) fn web_password_hash(password:Arr u8 n,iterations:i64) -> BytesResult
+  = if n<8 || n>1024 || iterations<600000 || iterations>1000000 then bytes_error(22,"password hashing requires 600000..1000000 rounds and 8..1024 bytes",0) else
+    let salt=random_bytes(16) in if !salt.ok then salt else let hash=pbkdf2_sha256(password,salt.value,iterations,32) in
+    if !hash.ok then hash else bytes_ok(concat("p1.",int_text(iterations),".",base64url_encode(salt.value),".",base64url_encode(hash.value)))
+fn web_password_verify(password:Arr u8 n,encoded:Arr u8 m) -> bool
+  = if n>1024 || m>256 then false else let rounds=int_parse(session_piece(encoded,1)) in
+    let salt=base64url_decode(session_piece(encoded,2)) in let expected=base64url_decode(session_piece(encoded,3)) in
+    if !str_equal(session_piece(encoded,0),"p1") || !rounds.ok || rounds.value<600000 || rounds.value>1000000 || !salt.ok || len(salt.value)<16 || !expected.ok || len(expected.value)!=32 then false else
+    let actual=pbkdf2_sha256(password,salt.value,rounds.value,32) in actual.ok && crypto_equal(actual.value,expected.value)
+
+; Fixed-window limiter on one counter file, serialized with flock across
+; workers. Pass an application-owned path. I/O errors fail closed.
+effect(fs) fn web_rate_limit(path:Arr u8 n,now:i64,limit:i64,window:i64) -> bool
+  = if !io_path_valid(path) || now<0 || limit<1 || limit>100000 || window<1 || window>86400000 then false else
+    let opened=file_open(path,3) in if !opened.ok then false else
+    let locked=file_lock(opened.value,true) in let raw=if locked.ok then file_read(opened.value,1024) else bytes_error(locked.error.code,locked.error.message,0) in
+    let until=int_parse(web_query_get(raw.value,"until").value) in let count=int_parse(web_query_get(raw.value,"count").value) in
+    let fresh=len(raw.value)==0 || until.ok && until.value<=now in
+    let valid=raw.ok && (fresh || until.ok && count.ok && count.value>=0 && count.value<limit) in
+    let rewound=if valid then file_seek(opened.value,0) else int_error(13,"rate limit",0) in
+    let truncated=if rewound.ok then file_truncate(opened.value,0) else rewound in
+    let written=if truncated.ok then file_write(opened.value,concat("until=",int_text(if fresh then now+window else until.value),"&count=",int_text(if fresh then 1 else count.value+1))) else truncated in
+    let synced=if written.ok then file_sync(opened.value) else written in let closed=file_close(opened.value) in synced.ok && closed.ok
+
+; Per-client limiting: one counter per client address (an IPv6 client by its
+; /64), hashed into one of 65536 counter files in `directory`, created as used.
+; Clients whose addresses hash alike share a counter, and a sender with many
+; addresses still gets many counters, so keep an account-wide limit as well.
+; Requests with no client address (static rendering) share one counter.
+effect(fs) fn web_rate_limit_address(directory:Arr u8 n,address:Arr u8 m,now:i64,limit:i64,window:i64) -> bool
+  = if !io_path_valid(directory) || m!=0 && m!=4 && m!=16 then false else
+    let hash=sha256(if m==16 then str_slice(address,0,8) else address) in
+    let made=fs_mkdir(directory) in
+    web_rate_limit(concat(directory,"/client-",int_text(str_byte(hash,0)*256+str_byte(hash,1))),now,limit,window)
+; The client is web_client_ip's address: the peer, or behind NEO_TRUSTED_PROXIES
+; the forwarded client.
+effect(fs,net,env) fn web_rate_limit_client(request:WebRequest,directory:Arr u8 n,now:i64,limit:i64,window:i64) -> bool
+  = web_rate_limit_address(directory,web_ip_parse(web_client_ip(request)),now,limit,window)

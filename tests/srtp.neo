@@ -1,0 +1,24 @@
+import "pkg:srtp" as srtp
+import "std:io"
+import "std:json"
+import "std:arena"
+import "std:debug"
+private fn hex_nibble(byte:i64) -> i64 = if byte>=48 && byte<=57 then byte-48 else if byte>=97 && byte<=102 then byte-87 else -1
+private fn decode(text:Arr u8 n) -> Arr u8 _
+  = arr(i in 0..n/2) u8(hex_nibble(str_byte(text,i*2))*16+hex_nibble(str_byte(text,i*2+1)))
+private fn encode(bytes:Arr u8 n) -> Arr u8 _
+  = arr(i in 0..n*2) u8(str_byte("0123456789abcdef",if i%2==0 then str_byte(bytes,i/2)/16 else str_byte(bytes,i/2)%16))
+private effect(fs,net,process) fn exercise(mode:i64,doc:Json) -> unit
+  = using arena=new_arena(4) in
+    let key=decode(json_text(json_get(doc,"key").value).value) in let salt=decode(json_text(json_get(doc,"salt").value).value) in
+    if mode==0 then
+      let result=loop(i=0,out="") while i<3 next(i+1,let bytes=srtp::srtp_derive(key,salt,i,if i==0 then 16 else if i==1 then 20 else 14) in check bytes.ok in concat(out,encode(bytes.value),"\n")) yield out in
+      let output=print_out(result) in noop() else
+    let ssrc=json_int(json_get(doc,"ssrc").value).value in using context=srtp::srtp_new(arena,key,salt,ssrc) in let status=srtp::srtp_status(context) in check status.ok in
+    let packets=json_array_values(json_get(doc,"packets").value) in
+    let written=loop(i=0) while i<len(packets) next(check i>=0 && i<len(packets) in
+      let packet=decode(json_text(packets[i]).value) in let result=if mode==1 then srtp::srtp_encrypt(context,packet) else if mode==2 then srtp::srtp_decrypt(context,packet) else if mode==3 then srtp::srtcp_encrypt(context,packet) else srtp::srtcp_decrypt(context,packet) in
+      let output=print_out(concat(if result.ok then encode(result.value) else "error","\n")) in i+1) yield i in noop()
+effect(fs,net,process,env) fn main() -> unit
+  = let raw=file_read(0,1048576) in check raw.ok in let parsed=json_parse(raw.value) in check parsed.ok in
+    let baseline=live_resources() in let done=exercise(int_parse(cli_arg(1).value).value,parsed.value) in let live=live_resources() in check live==baseline in noop()

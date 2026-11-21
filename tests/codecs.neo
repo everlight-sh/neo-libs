@@ -1,0 +1,21 @@
+import "std:vec"
+import "std:json"
+import "../websocket/src/lib.neo" as ws
+import "../jsonrpc/src/lib.neo" as rpc
+import "../http-server/src/lib.neo" as server
+import "std:io"
+effect(fs,env) fn main() -> unit
+  = let mode=int_parse(cli_arg(1).value).value in let raw=file_read(0,4194304) in check raw.ok in
+    let result=if mode==0 then ws::websocket_accept(raw.value) else
+    if mode==1 then bytes_ok(ws::websocket_sha1(raw.value)) else
+    if mode==2 then ws::websocket_encode(1,true,raw.value,true,"\x37\xfa\x21\x3d") else
+    if mode==3 || mode==4 then
+      let server=mode==3 in let initial=ws::websocket_new(server,1048576) in
+      let feed=loop(i=0,feed=ws::WSFeed { state=initial,events=vec_empty::<ws::WSEvent>(),ok=true }) while feed.ok && i<len(raw.value) next(i+1,
+        let step=ws::websocket_feed(feed.state,str_slice(raw.value,i,i+1)) in
+        ws::WSFeed { state=step.state,events=loop(j=0,out=feed.events) while j<vec_len(step.events) next(j+1,match vec_get(step.events,j) { None => out,Some(event) => vec_push(out,event) }) yield out,ok=step.ok }) yield feed in
+      if !feed.ok then bytes_error(1,"invalid",0) else bytes_ok(loop(i=0,out="") while i<vec_len(feed.events) next(i+1,match vec_get(feed.events,i) { None => out,Some(event) => concat(out,int_text(event.opcode),":",json_quote(event.payload),"\n") }) yield out) else
+    if mode==5 then let message=rpc::rpc_decode(raw.value) in if !message.ok then bytes_error(1,"invalid",0) else bytes_ok(concat(int_text(message.kind)," ",json_encode(message.id)," ",json_quote(message.method))) else
+    if mode==6 then server::sse_encode("message",raw.value,"42") else
+    if mode==7 then bytes_ok(if ws::websocket_upgrade_valid(raw.value,"dGhlIHNhbXBsZSBub25jZQ==") then "valid" else "invalid") else bytes_error(22,"mode",0) in
+    let out=print_out(if result.ok then result.value else "error") in noop()

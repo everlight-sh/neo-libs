@@ -1,0 +1,23 @@
+import "pkg:websocket" as ws
+import "std:https_client"
+import "std:io"
+import "std:debug"
+private effect(fs,net,time,process) fn next_print<C>(move state:ws::WSLive<C>,deadline:i64) -> ws::WSRead<C>
+  = let result=ws::websocket_next_io(state,deadline) in
+    let output=if result.has_event && result.event.opcode==1 then print_out(concat("text:",result.event.payload,"\n")) else int_ok(0) in result
+private effect(fs,net,time,process) fn chat<C>(io:HttpIO<C>,deadline:i64,mode:i64) -> unit
+  = let headers=arr(i in 0..0) HttpHeader { name="",value="" } in let opened=ws::websocket_connect_io(io,"localhost","/events",headers,65536,deadline) in
+    if !opened.ok then let out=print_out(concat("error:",int_text(opened.error.code))) in noop() else
+    let sent=ws::websocket_send_io(opened,1,"hello",deadline) in check sent.ok in
+    let result=loop(result=next_print(sent,deadline),count=0) while result.ok && !result.closed && count<16 next(next_print(result.state,deadline),count+1) yield result in
+    if !result.ok then let out=print_out(concat("error:",int_text(result.error.code))) in noop() else noop()
+private effect(fs,net,time,process) fn exercise(port:i64,secure:bool,trust:Arr u8 _,mode:i64) -> unit
+  = using arena=new_arena(4) in using cancellation=new_cancellation() in let cancel_ref=adopt(cancellation,arena) in
+    let timer=deadline_after(if mode==2 then 100 else 4000) in using socket=tcp_connect_ipv4_cancel("127.0.0.1",port,timer.value,borrow_ref(cancel_ref)) in
+    let status=socket_status(socket) in check status.ok in let socket_ref=adopt(socket,arena) in
+    if secure then
+      let cert=fs_read(trust) in check cert.ok in using tls=tls_connect_cancel(borrow_ref(socket_ref),"localhost",arr(i in 0..1) x509_parse(cert.value),timer.value,borrow_ref(cancel_ref)) in
+      let status=tls_status(tls) in check status.ok in let tls_ref=adopt(tls,arena) in chat(http_tls_transport(socket_ref,tls_ref),timer.value,mode) else chat(http_plain_transport(socket_ref,cancel_ref),timer.value,mode)
+effect(fs,net,time,process,env) fn main() -> unit
+  = let baseline=live_resources() in let done=exercise(int_parse(cli_arg(1).value).value,str_equal(cli_arg(2).value,"tls"),cli_arg(3).value,int_parse(cli_arg(4).value).value) in
+    let live=live_resources() in check live==baseline in noop()

@@ -1,0 +1,99 @@
+import "pkg:jsonrpc" as rpc
+import "std:json"
+import "std:process"
+import "std:reactor"
+import "std:arena"
+
+; Transport-independent bounded sequential MCP client. Resources stay in an
+; external Arena, and captures carry generational references instead of owners.
+type MCPTransport<C> = { context:C,read:Effect<fs,net,time,process>(C,i64)->BytesResult,write:Effect<fs,net,time,process>(C,Arr u8 _,i64)->IntResult }
+sealed type MCP<C> = { io:MCPTransport<C>,pending:Arr u8 _,next_id:i64,ready:bool,failed:bool,protocol:Arr u8 _,failure:Error,notifications:Vec<Json> }
+type MCPReply<C> = { state:MCP<C>,ok:bool,finished:bool,result:Json,rpc_error:Json,error:Error }
+type MCPRead<C> = { state:MCP<C>,ok:bool,line:Arr u8 _,error:Error }
+type MCPProcess = { process:Ref<Process>,cancellation:Ref<Cancellation> }
+fn mcp_new<C>(io:MCPTransport<C>) -> MCP<C>
+  = MCP::<C> { io=io,pending="",next_id=1,ready=false,failed=false,protocol="",failure=no_error(),notifications=vec_empty::<Json>() }
+private fn mcp_failure<C>(move state:MCP<C>,code:i64,message:Arr u8 _) -> MCPReply<C>
+  = MCPReply::<C> { state=state with { failed=true,failure=Error { code=code,message=message,position=0 } },ok=false,finished=true,result=json_value_null(),rpc_error=json_value_null(),error=Error { code=code,message=message,position=0 } }
+private effect(fs,net,time,process) fn mcp_write<C>(io:MCPTransport<C>,wire:Arr u8 n,deadline:i64) -> IntResult
+  = let send=io.write in send(io.context,concat(json_compact(wire),"\n"),deadline)
+private effect(fs,net,time,process) fn mcp_read_step<C>(move state:MCP<C>,deadline:i64) -> MCP<C>
+  = let read=state.io.read in let received=read(state.io.context,deadline) in
+    if !received.ok || len(received.value)==0 || len(state.pending)+len(received.value)>1048576 then state with { failed=true,failure=if !received.ok then received.error else Error { code=if len(received.value)==0 then 5 else 27,message="MCP stream closed or exceeded limit",position=0 } } else
+    state with { pending=concat(state.pending,received.value) }
+private effect(fs,net,time,process) fn mcp_line<C>(move state:MCP<C>,deadline:i64) -> MCPRead<C>
+  = let filled=loop(state=state) while !state.failed && !str_find(state.pending,"\n").present next(mcp_read_step(state,deadline)) yield state in
+    let newline=str_find(filled.pending,"\n") in
+    if filled.failed || !newline.present then MCPRead::<C> { state=filled,ok=false,line="",error=filled.failure } else
+    let line=str_slice(filled.pending,0,newline.value) in let pending=str_slice(filled.pending,newline.value+1,len(filled.pending)) in
+    MCPRead::<C> { state=filled with { pending=pending },ok=true,line=line,error=no_error() }
+private effect(fs,net,time,process) fn mcp_receive<C>(move state:MCP<C>,id:i64,deadline:i64) -> MCPReply<C>
+  = loop(reply=MCPReply::<C> { state=state,ok=true,finished=false,result=json_value_null(),rpc_error=json_value_null(),error=no_error() },count=0) while reply.ok && !reply.finished && count<256 next(
+    let line=mcp_line(reply.state,deadline) in if !line.ok then mcp_failure(line.state,line.error.code,line.error.message) else
+    let message=rpc::rpc_decode(line.line) in
+    if !message.ok then mcp_failure(line.state,71,"invalid JSON-RPC envelope") else
+    if message.kind==2 then
+      if vec_len(line.state.notifications)>=64 then mcp_failure(line.state,27,"MCP notification limit") else
+        MCPReply::<C> { state=line.state with { notifications=vec_push(line.state.notifications,json_parse(line.line).value) },ok=true,finished=false,result=json_value_null(),rpc_error=json_value_null(),error=no_error() } else
+    if message.kind==1 then
+      let response=if str_equal(message.method,"ping") then rpc::rpc_result(message.id,json_parse("{}").value).value else
+        concat("{\"jsonrpc\":\"2.0\",\"id\":",json_encode(message.id),",\"error\":{\"code\":-32601,\"message\":\"Method not supported\"}}") in
+      let sent=mcp_write(line.state.io,response,deadline) in
+      if !sent.ok then mcp_failure(line.state,sent.error.code,sent.error.message) else
+        MCPReply::<C> { state=line.state,ok=true,finished=false,result=json_value_null(),rpc_error=json_value_null(),error=no_error() } else
+    if !rpc::rpc_id_equal(message.id,json_value_int(id)) then mcp_failure(line.state,71,"MCP response ID mismatch") else
+      MCPReply::<C> { state=line.state,ok=message.kind==3,finished=true,result=message.result,rpc_error=message.error,error=if message.kind==3 then no_error() else Error { code=5,message="MCP remote error",position=0 } },
+    count+1) yield if count>=256 && !reply.finished then mcp_failure(reply.state,27,"MCP interleaved message limit") else reply
+; The receive loop uses an explicit finished flag derived from envelope kind,
+; not the result payload: a valid JSON-RPC result may itself be null.
+effect(fs,net,time,process) fn mcp_request<C>(move state:MCP<C>,method:Arr u8 n,params:Json,deadline:i64) -> MCPReply<C>
+  = if state.failed || state.next_id>=1000000000 then mcp_failure(state,9,"MCP connection unavailable") else
+    if !state.ready && !str_equal(method,"initialize") && !str_equal(method,"ping") then mcp_failure(state,22,"MCP must initialize first") else
+    if state.ready && str_equal(method,"initialize") then mcp_failure(state,22,"MCP already initialized") else
+    let id=state.next_id in let wire=rpc::rpc_request(id,method,params) in
+    if !wire.ok then mcp_failure(state,wire.error.code,wire.error.message) else
+    let sent=mcp_write(state.io,wire.value,deadline) in if !sent.ok then mcp_failure(state,sent.error.code,sent.error.message) else
+      mcp_receive(state with { next_id=id+1 },id,deadline)
+effect(fs,net,time,process) fn mcp_initialize<C>(move state:MCP<C>,deadline:i64) -> MCPReply<C>
+  = let params=json_parse("{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"neo-mcp\",\"version\":\"0.1.0\"}}").value in
+    let reply=mcp_request(state,"initialize",params,deadline) in if !reply.ok then reply else
+    let version=json_text(json_get(reply.result,"protocolVersion").value) in
+    let info=json_get(reply.result,"serverInfo") in let capabilities=json_get(reply.result,"capabilities") in
+    if !version.ok || !(str_equal(version.value,"2025-06-18") || str_equal(version.value,"2025-03-26") || str_equal(version.value,"2024-11-05")) || info.value.kind!=6 || capabilities.value.kind!=6 then mcp_failure(reply.state,71,"unsupported MCP initialization response") else
+    let sent=mcp_write(reply.state.io,rpc::rpc_notification("notifications/initialized",json_parse("{}").value).value,deadline) in
+    if !sent.ok then mcp_failure(reply.state,sent.error.code,sent.error.message) else
+      reply with { state=reply.state with { ready=true,protocol=version.value } }
+effect(fs,net,time,process) fn mcp_tools_list<C>(move state:MCP<C>,cursor:Arr u8 n,deadline:i64) -> MCPReply<C>
+  = mcp_request(state,"tools/list",json_parse(if n==0 then "{}" else concat("{\"cursor\":",json_quote(cursor),"}")).value,deadline)
+effect(fs,net,time,process) fn mcp_tools_call<C>(move state:MCP<C>,name:Arr u8 n,arguments:Json,deadline:i64) -> MCPReply<C>
+  = if n==0 || arguments.kind!=6 then mcp_failure(state,22,"invalid tool name or arguments") else
+    mcp_request(state,"tools/call",json_parse(concat("{\"name\":",json_quote(name),",\"arguments\":",json_encode(arguments),"}")).value,deadline)
+effect(fs,net,time,process) fn mcp_process_read(context:MCPProcess,deadline:i64) -> BytesResult
+  = loop(result=bytes_error(rt_again(),"pending",0)) while !result.ok && (result.error.code==rt_again() || result.error.code==4) next(
+    if is_cancelled(borrow_ref(context.cancellation)) then bytes_error(125,"MCP read cancelled",0) else
+    if deadline_remaining(deadline)==0 then bytes_error(110,"MCP read deadline",0) else
+    let result=process_try_read(borrow_ref(context.process),1,16384) in
+    if result.ok || result.error.code!=rt_again() && result.error.code!=4 then result else
+      let drained=process_try_read(borrow_ref(context.process),2,16384) in
+      let output=process_interest(borrow_ref(context.process),1,1,0) in let errors=process_interest(borrow_ref(context.process),2,1,1) in
+      let interests=if drained.ok && len(drained.value)==0 then arr(i in 0..1) output else arr(i in 0..2) if i==0 then output else errors in
+      let ready=reactor_wait(interests,deadline,borrow_ref(context.cancellation)) in
+      if !ready.ok then bytes_error(ready.error.code,ready.error.message,0) else result) yield result
+effect(fs,net,time,process) fn mcp_process_write(context:MCPProcess,bytes:Arr u8 n,deadline:i64) -> IntResult
+  = loop(result=int_ok(0)) while result.ok && result.value<n next(
+    if is_cancelled(borrow_ref(context.cancellation)) then int_error(125,"MCP write cancelled",result.value) else
+    if deadline_remaining(deadline)==0 then int_error(110,"MCP write deadline",result.value) else
+    let written=process_try_write(borrow_ref(context.process),bytes,result.value) in
+    if written.ok then if written.value==0 then int_error(5,"MCP stream closed",result.value) else int_ok(result.value+written.value) else
+    if written.error.code!=rt_again() && written.error.code!=4 then written else
+      let drained=process_try_read(borrow_ref(context.process),2,16384) in
+      let output=process_interest(borrow_ref(context.process),1,4,0) in let errors=process_interest(borrow_ref(context.process),2,1,1) in
+      let interests=if drained.ok && len(drained.value)==0 then arr(i in 0..1) output else arr(i in 0..2) if i==0 then output else errors in
+      let ready=reactor_wait(interests,deadline,borrow_ref(context.cancellation)) in
+      if !ready.ok then int_error(ready.error.code,ready.error.message,result.value) else result) yield result
+fn mcp_process_transport(process:Ref<Process>,cancellation:Ref<Cancellation>) -> MCPTransport<MCPProcess>
+  = MCPTransport::<MCPProcess> { context=MCPProcess { process=process,cancellation=cancellation },read=function(mcp_process_read),write=function(mcp_process_write) }
+
+type MCPNotifications<C> = { state:MCP<C>,messages:Vec<Json> }
+fn mcp_take_notifications<C>(move state:MCP<C>) -> MCPNotifications<C>
+  = MCPNotifications::<C> { state=state with { notifications=vec_empty::<Json>() },messages=state.notifications }

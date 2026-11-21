@@ -1,0 +1,17 @@
+import "pkg:dom" as dom
+import "std:io"
+
+; Parses stdin as a document, or as a fragment when a context element is given,
+; and prints the tree in the html5lib-tests format for test_dom.py.
+; Arguments: scripting (0 or 1), then optionally the context: "td", "svg path", "math mi".
+effect(fs,env) fn main() -> unit
+  = let raw=file_read(0,16777216) in check raw.ok in
+    let scripting=cli_arg(1).present && str_equal(cli_arg(1).value,"1") in
+    let context=cli_arg(2) in
+    let out=if !context.present then (let tree=dom::dom_parse_with(raw.value,scripting) in dom::dom_dump(tree,0)) else
+      let name=context.value in
+      let ns=if str_starts(name,"svg ") then 1 else if str_starts(name,"math ") then 2 else 0 in
+      let local=if ns==1 then str_slice(name,4,len(name)) else if ns==2 then str_slice(name,5,len(name)) else name in
+      let tree=dom::dom_parse_fragment(raw.value,local,ns,scripting) in
+      dom::dom_dump(tree,dom::dom_first_child(tree,0)) in
+    let printed=print_out(out) in noop()

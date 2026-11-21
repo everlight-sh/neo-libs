@@ -1,0 +1,30 @@
+import "std:reactor"
+import "std:debug"
+import "std:io"
+private fn args(text:Arr u8 _) -> Arr Arr u8 _ _ = arr(i in 0..1) text
+private fn empty_args() -> Arr Arr u8 _ _ = arr(i in 0..0) ""
+effect(fs,net,env,time,process) fn main() -> unit
+  = let executable=cli_arg(1).value in let script=cli_arg(2).value in
+    let baseline=live_resources() in
+    let checked=exercise(executable,script) in let live=live_resources() in check live==baseline in
+    let out=print_out("reactor/process OK\n") in noop()
+private effect(fs,net,env,time,process) fn exercise(executable:Arr u8 _,script:Arr u8 _) -> unit
+  = using cancellation=new_cancellation() in using first=process_start(executable,args(script),empty_args()) in
+    using second=process_start(executable,args(script),empty_args()) in
+    let a=process_try_write(first,"alpha",0) in let b=process_try_write(second,"beta",0) in check a.ok && b.ok in
+    let c=process_close_input(first) in let d=process_close_input(second) in let e=process_close_input(second) in check c.ok && d.ok && e.ok in
+    let read_a=process_interest(first,1,1,41) in let read_b=process_interest(second,1,1,42) in
+    let interests=arr(i in 0..2) if i==0 then read_a else read_b in let timer=deadline_after(3000) in
+    let ready=reactor_wait(interests,timer.value,cancellation) in check ready.ok && vec_len(ready.events)>0 in
+    let one=collect(first,timer.value,cancellation) in let two=collect(second,timer.value,cancellation) in
+    check str_equal(one,"ALPHA") && str_equal(two,"BETA") in
+    let empty=arr(i in 0..0) read_a in let short=deadline_after(20) in let timeout=reactor_wait(empty,short.value,cancellation) in check timeout.ok && timeout.timed_out in
+    let stopped=cancel(cancellation) in let result=reactor_wait(empty,timer.value,cancellation) in check !result.ok && result.cancelled && result.error.code==125 in noop()
+type Collected = { bytes:Arr u8 _,done:bool }
+private effect(fs,net,time,process) fn collect_step(process:Process,move state:Collected,deadline:i64,cancellation:Cancellation) -> Collected
+  = let interest=process_interest(process,1,1,1) in let ready=reactor_wait(arr(i in 0..1) interest,deadline,cancellation) in check ready.ok && !ready.timed_out in
+    let chunk=process_try_read(process,1,16384) in
+    if !chunk.ok then check chunk.error.code==rt_again() || chunk.error.code==4 in state else
+      Collected { bytes=concat(state.bytes,chunk.value),done=len(chunk.value)==0 }
+private effect(fs,net,time,process) fn collect(process:Process,deadline:i64,cancellation:Cancellation) -> Arr u8 _
+  = let result=loop(state=Collected { bytes="",done=false }) while !state.done next(collect_step(process,state,deadline,cancellation)) yield state in result.bytes

@@ -1,0 +1,182 @@
+{
+  "format": 1,
+  "packages": {
+    "neo-audio@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-audio",
+      "path": "audio",
+      "sha256": "c2f9dadb6fd4b003880d2f508598cfabb8f587f232d4f0de2aa9355e4c7064d1",
+      "version": "0.1.0"
+    },
+    "neo-dom@0.1.0": {
+      "dependencies": {
+        "html": "neo-html@0.1.0"
+      },
+      "dependency_paths": {
+        "html": "../html"
+      },
+      "name": "neo-dom",
+      "path": "dom",
+      "sha256": "7b2e87680b9f22073ef8917d15d1e3aa51a06cec8a9249522754e7826323ce5a",
+      "version": "0.1.0"
+    },
+    "neo-html@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-html",
+      "path": "html",
+      "sha256": "d34263583f965661371d92472cb2e34d9cc2aee468429662743d8492424abd9e",
+      "version": "0.1.0"
+    },
+    "neo-http-client@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-http-client",
+      "path": "http-client",
+      "sha256": "1c830b65025d9d73eda52c7779e188d8cde9aa8b0403bb5381768900d9eef24e",
+      "version": "0.1.0"
+    },
+    "neo-http-server@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-http-server",
+      "path": "http-server",
+      "sha256": "6736b4aa6d922c17ee07907113af13f2cd91ad84c991f8f9cddc394832ad5df8",
+      "version": "0.1.0"
+    },
+    "neo-jsonrpc@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-jsonrpc",
+      "path": "jsonrpc",
+      "sha256": "85b8cab2fa93d6f38a0e087e9f4f59e9da6904c177d9ed86ef4f036f84460f80",
+      "version": "0.1.0"
+    },
+    "neo-jwt@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-jwt",
+      "path": "jwt",
+      "sha256": "a01f9cc95b41be9b800ab7428b028866fa7a1955bd5a1e6507c30da48ae80f52",
+      "version": "0.1.0"
+    },
+    "neo-libs-tests@0.1.0": {
+      "dependencies": {
+        "audio": "neo-audio@0.1.0",
+        "dom": "neo-dom@0.1.0",
+        "html": "neo-html@0.1.0",
+        "http-client": "neo-http-client@0.1.0",
+        "http-server": "neo-http-server@0.1.0",
+        "jsonrpc": "neo-jsonrpc@0.1.0",
+        "jwt": "neo-jwt@0.1.0",
+        "mcp": "neo-mcp@0.1.0",
+        "oauth2": "neo-oauth2@0.1.0",
+        "opus-packet": "neo-opus-packet@0.1.0",
+        "providers": "neo-providers@0.1.0",
+        "rtp": "neo-rtp@0.1.0",
+        "srtp": "neo-srtp@0.1.0",
+        "stun": "neo-stun@0.1.0",
+        "websocket": "neo-websocket@0.1.0"
+      },
+      "dependency_paths": {
+        "audio": "audio",
+        "dom": "dom",
+        "html": "html",
+        "http-client": "http-client",
+        "http-server": "http-server",
+        "jsonrpc": "jsonrpc",
+        "jwt": "jwt",
+        "mcp": "mcp",
+        "oauth2": "oauth2",
+        "opus-packet": "opus-packet",
+        "providers": "providers",
+        "rtp": "rtp",
+        "srtp": "srtp",
+        "stun": "stun",
+        "websocket": "websocket"
+      },
+      "name": "neo-libs-tests",
+      "path": ".",
+      "sha256": null,
+      "version": "0.1.0"
+    },
+    "neo-mcp@0.1.0": {
+      "dependencies": {
+        "jsonrpc": "neo-jsonrpc@0.1.0"
+      },
+      "dependency_paths": {
+        "jsonrpc": "../jsonrpc"
+      },
+      "name": "neo-mcp",
+      "path": "mcp",
+      "sha256": "3ac90e40853958079d3c37d57767fc68219d36132912fb9d194f20590fee3112",
+      "version": "0.1.0"
+    },
+    "neo-oauth2@0.1.0": {
+      "dependencies": {
+        "jwt": "neo-jwt@0.1.0"
+      },
+      "dependency_paths": {
+        "jwt": "../jwt"
+      },
+      "name": "neo-oauth2",
+      "path": "oauth2",
+      "sha256": "73e87fb68ec82ca8ff5aa45a30b988d848da003a7f6ce4daa2dfc2a357887eea",
+      "version": "0.1.0"
+    },
+    "neo-opus-packet@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-opus-packet",
+      "path": "opus-packet",
+      "sha256": "cf44ae05aacc970cff03b7291a53252c2259d73c144943882d5cbfda63970bcf",
+      "version": "0.1.0"
+    },
+    "neo-providers@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-providers",
+      "path": "providers",
+      "sha256": "84fd2177c1d0d06256ccc3cb586be024e14197278853412c2c814b6c88d37b3a",
+      "version": "0.1.0"
+    },
+    "neo-rtp@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-rtp",
+      "path": "rtp",
+      "sha256": "1b3b13181ff84c84d4625098ac59583bb4ddb88e17a00931e8732768be22e64c",
+      "version": "0.1.0"
+    },
+    "neo-srtp@0.1.0": {
+      "dependencies": {
+        "rtp": "neo-rtp@0.1.0"
+      },
+      "dependency_paths": {
+        "rtp": "../rtp"
+      },
+      "name": "neo-srtp",
+      "path": "srtp",
+      "sha256": "d366a1ae770e10165f33b1ef03da3181c39cc129cb1a7c8116d8a9d9beeda071",
+      "version": "0.1.0"
+    },
+    "neo-stun@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-stun",
+      "path": "stun",
+      "sha256": "b57d16e6e42288d0ba2dcbcda4297f453546c5c11da3ef91b02dd295b6cd296b",
+      "version": "0.1.0"
+    },
+    "neo-websocket@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-websocket",
+      "path": "websocket",
+      "sha256": "5de4c14c8748fa0f50fa5345d550082c157b612219edd1df30878cc35ed9d40e",
+      "version": "0.1.0"
+    }
+  },
+  "root": "neo-libs-tests@0.1.0"
+}

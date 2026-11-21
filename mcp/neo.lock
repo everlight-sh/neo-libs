@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "packages": {
+    "neo-jsonrpc@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-jsonrpc",
+      "path": "../jsonrpc",
+      "sha256": "85b8cab2fa93d6f38a0e087e9f4f59e9da6904c177d9ed86ef4f036f84460f80",
+      "version": "0.1.0"
+    },
+    "neo-mcp@0.1.0": {
+      "dependencies": {
+        "jsonrpc": "neo-jsonrpc@0.1.0"
+      },
+      "dependency_paths": {
+        "jsonrpc": "../jsonrpc"
+      },
+      "name": "neo-mcp",
+      "path": ".",
+      "sha256": null,
+      "version": "0.1.0"
+    }
+  },
+  "root": "neo-mcp@0.1.0"
+}

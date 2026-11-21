@@ -1,0 +1,74 @@
+import "std:http_server"
+import "std:url"
+import "std:sha256"
+import "std:base64"
+import "std:random"
+import "std:json"
+import "std:transport"
+import "std:net"
+import "pkg:jwt"
+
+; OAuth 2 authorization-code + PKCE S256, signed browser-bound state, and a
+; fixed HTTPS user-info endpoint. Optional OIDC also verifies signed ID tokens
+; using a fixed issuer/JWKS, browser-bound nonce and matching user-info subject.
+sealed type OAuthProvider = {ok:bool,authorize:HTTPURL,token:HTTPURL,userinfo:HTTPURL,client:Arr u8 _,redirect:HTTPURL,scope:Arr u8 _,claim:Arr u8 _,issuer:Arr u8 _,jwks:HTTPURL}
+type OAuthStart = {ok:bool,url:Arr u8 _,cookie:Arr u8 _,error:Error}
+sealed type OAuthCallback = {ok:bool,code:Arr u8 _,verifier:Arr u8 _,nonce:Arr u8 _,stamp:i64,error:Error}
+sealed type OAuthIdentity = {ok:bool,subject:Arr u8 _,issuer:Arr u8 _,profile:Json,error:Error}
+type OAuthHTTP = {request:Effect<fs,net,time,process>(HTTPURL,Arr u8 _,Arr HttpHeader _,Arr u8 _)->HttpResult}
+fn oauth_provider(authorize:Arr u8 n,token:Arr u8 m,userinfo:Arr u8 k,client:Arr u8 q,redirect:Arr u8 r,scope:Arr u8 s)->OAuthProvider
+  = let a=url_parse_http(authorize) in let t=url_parse_http(token) in let u=url_parse_http(userinfo) in let callback=url_parse_http(redirect) in
+    OAuthProvider {ok=a.ok && t.ok && u.ok && callback.ok && a.secure && t.secure && u.secure &&
+      (callback.secure || str_equal(callback.host,"127.0.0.1") || str_equal(callback.host,"localhost")) && q>0 && q<=512 && s<=2048 && !str_find(redirect,"#").present,
+      authorize=a,token=t,userinfo=u,client=client,redirect=callback,scope=scope,claim="sub",issuer="",jwks=url_parse_http("")}
+fn oauth_oidc(provider:OAuthProvider,issuer:Arr u8 n,jwks:Arr u8 m)->OAuthProvider
+  = let url=url_parse_http(issuer) in let keys=url_parse_http(jwks) in
+    provider with {ok=provider.ok && url.ok && url.secure && keys.ok && keys.secure && n<=2048 && m<=2048 &&
+      !str_find(issuer,"?").present && !str_find(issuer,"#").present && !str_find(jwks,"#").present && str_equal(provider.claim,"sub") &&
+      str_find(concat(" ",provider.scope," ")," openid ").present,issuer=issuer,jwks=keys}
+private fn oauth_part(value:Arr u8 n,index:i64)->Arr u8 _
+  = loop(at=0,i=0,out="") while at<=n && i<=index next(
+      let end=str_find(str_slice(value,at,n),".") in if end.present then at+end.value+1 else n+1,i+1,
+      if i==index then let end=str_find(str_slice(value,at,n),".") in str_slice(value,at,if end.present then at+end.value else n) else out) yield out
+private fn oauth_binding(provider:OAuthProvider)->Arr u8 _
+  = base64url_encode(sha256(concat(provider.authorize.origin,provider.authorize.target,"|",provider.token.origin,provider.token.target,"|",provider.userinfo.origin,provider.userinfo.target,"|",provider.client,"|",provider.redirect.origin,provider.redirect.target,"|",provider.claim,"|",provider.issuer,"|",provider.jwks.origin,provider.jwks.target)))
+effect(process) fn oauth_begin(provider:OAuthProvider,key:Arr u8 n,now:i64)->OAuthStart
+  = if !provider.ok || n<32 || now<=0 || now>9223372036854175807 then OAuthStart {ok=false,url="",cookie="",error=Error {code=22,message="Invalid OAuth configuration",position=0}} else
+    let random=random_bytes(64) in if !random.ok then OAuthStart {ok=false,url="",cookie="",error=random.error} else
+    let state=base64url_encode(str_slice(random.value,0,32)) in let verifier=base64url_encode(str_slice(random.value,32,64)) in
+    let payload=concat("o1.",state,".",verifier,".",int_text(now+600000),".",oauth_binding(provider)) in
+    let cookie=concat(payload,".",base64url_encode(hmac_sha256(key,concat("neo-oauth:",payload)))) in
+    let url=concat(provider.authorize.origin,provider.authorize.target,if str_find(provider.authorize.target,"?").present then "&" else "?",
+      "response_type=code&client_id=",url_encode(provider.client,false),"&redirect_uri=",url_encode(concat(provider.redirect.origin,provider.redirect.target),false),
+      "&scope=",url_encode(provider.scope,false),"&state=",state,"&code_challenge=",base64url_encode(sha256(verifier)),"&code_challenge_method=S256",if len(provider.issuer)>0 then concat("&nonce=",state) else "") in
+    OAuthStart {ok=true,url=url,cookie=cookie,error=no_error()}
+fn oauth_callback(provider:OAuthProvider,query:Arr u8 n,cookie:Arr u8 m,key:Arr u8 k,now:i64)->OAuthCallback
+  = let state=oauth_part(cookie,1) in let verifier=oauth_part(cookie,2) in let expires=int_parse(oauth_part(cookie,3)) in let binding=oauth_part(cookie,4) in let signature=oauth_part(cookie,5) in
+    let payload=concat("o1.",state,".",verifier,".",oauth_part(cookie,3),".",binding) in let decoded=base64url_decode(verifier) in let code=web_query_get(query,"code") in
+    let valid=provider.ok && now>0 && k>=32 && m<=2048 && str_equal(cookie,concat(payload,".",signature)) && expires.ok && expires.value>now && expires.value-now<=600000 &&
+      decoded.ok && len(decoded.value)==32 && crypto_equal(state,web_query_get(query,"state").value) && crypto_equal(binding,oauth_binding(provider)) &&
+      crypto_equal(signature,base64url_encode(hmac_sha256(key,concat("neo-oauth:",payload)))) && code.present && len(code.value)>0 && len(code.value)<=4096 && !web_query_get(query,"error").present in
+    OAuthCallback {ok=valid,code=if valid then code.value else "",verifier=if valid then verifier else "",nonce=if valid then state else "",stamp=if valid then now else 0,error=if valid then no_error() else Error {code=13,message="Invalid or expired OAuth state",position=0}}
+fn oauth_token_body(provider:OAuthProvider,callback:OAuthCallback,secret:Arr u8 n)->Arr u8 _
+  = concat("grant_type=authorization_code&code=",url_encode(callback.code,true),"&client_id=",url_encode(provider.client,true),"&redirect_uri=",url_encode(concat(provider.redirect.origin,provider.redirect.target),true),"&code_verifier=",url_encode(callback.verifier,true),if n>0 then concat("&client_secret=",url_encode(secret,true)) else "")
+effect(fs,net,time,process) fn oauth_exchange(http:OAuthHTTP,provider:OAuthProvider,callback:OAuthCallback,secret:Arr u8 n)->OAuthIdentity
+  = if !provider.ok || !callback.ok then OAuthIdentity {ok=false,subject="",issuer="",profile=json_none().value,error=Error {code=13,message="OAuth state must be verified before exchange",position=0}} else
+    let request=http.request in let response=request(provider.token,"POST",arr(i in 0..2) if i==0 then HttpHeader {name="Content-Type",value="application/x-www-form-urlencoded"} else HttpHeader {name="Accept",value="application/json"},oauth_token_body(provider,callback,secret)) in
+    let parsed=json_parse(response.body) in let access=json_text(json_get(parsed.value,"access_token").value) in let token_type=json_text(json_get(parsed.value,"token_type").value) in
+    if !response.ok || response.status!=200 || !parsed.ok || parsed.value.count>32 || !json_object_unique(parsed.value) || !access.ok || len(access.value)<1 || len(access.value)>8192 || !web_header_safe(access.value) || !token_type.ok || !str_equal(http_lower(token_type.value),"bearer") then
+      OAuthIdentity {ok=false,subject="",issuer="",profile=json_none().value,error=Error {code=13,message="OAuth token exchange failed",position=0}} else
+    let keys=if len(provider.issuer)>0 then request(provider.jwks,"GET",arr(i in 0..1) HttpHeader {name="Accept",value="application/json"},"") else HttpResult {ok=false,status=0,body="",error=no_error()} in
+    let identity=oidc_verify(if keys.ok && keys.status==200 then json_text(json_get(parsed.value,"id_token").value).value else "",keys.body,
+      OIDCValidation {issuer=provider.issuer,audience=provider.client,nonce=callback.nonce,now=callback.stamp/1000,skew=30,max_age=3600},access.value) in
+    if len(provider.issuer)>0 && !identity.ok then OAuthIdentity {ok=false,subject="",issuer="",profile=json_none().value,error=identity.error} else
+    let response=request(provider.userinfo,"GET",arr(i in 0..2) if i==0 then HttpHeader {name="Authorization",value=concat("Bearer ",access.value)} else HttpHeader {name="Accept",value="application/json"},"") in
+    let profile=json_parse(response.body) in let field=json_get(profile.value,provider.claim) in let subject=if field.value.kind==3 then let parsed=json_int(field.value) in if parsed.ok then bytes_ok(int_text(parsed.value)) else bytes_error(22,"Invalid subject id",0) else json_text(field.value) in
+    if !response.ok || response.status!=200 || !profile.ok || profile.value.count>128 || !json_object_unique(profile.value) || !subject.ok || len(subject.value)<1 || len(subject.value)>256 || str_find(subject.value,"\0").present ||
+      len(provider.issuer)>0 && !str_equal(subject.value,identity.subject) then
+      OAuthIdentity {ok=false,subject="",issuer="",profile=json_none().value,error=Error {code=13,message="OAuth user-info identity was not verified",position=0}} else
+      OAuthIdentity {ok=true,subject=subject.value,issuer=if len(provider.issuer)>0 then identity.issuer else provider.userinfo.origin,profile=profile.value,error=no_error()}
+
+; Provider adapters may select a stable subject identifier, e.g. GitHub's id.
+; Email addresses are not verified identities without provider-specific checks.
+fn oauth_subject_claim(provider:OAuthProvider,claim:Arr u8 n)->OAuthProvider
+  = provider with {ok=provider.ok && n>0 && n<=64 && http_token(claim) && (len(provider.issuer)==0 || str_equal(claim,"sub")),claim=claim}

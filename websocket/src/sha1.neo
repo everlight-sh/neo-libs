@@ -1,0 +1,2 @@
+import "std:sha1"
+fn websocket_sha1(text:Arr u8 n) -> Arr u8 _ = sha1(text)

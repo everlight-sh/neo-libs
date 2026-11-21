@@ -1,0 +1,66 @@
+import "std:json"
+import "std:base64"
+import "std:rsa"
+import "std:url"
+
+; Compact JWS RS256 only, fixed caller-supplied JWKS. Never fetch a key URL
+; supplied by a token. RSA operations are native Neo std:rsa, not an FFI.
+sealed type JWTVerified = {ok:bool,claims:Json,error:Error}
+type OIDCValidation = {issuer:Arr u8 _,audience:Arr u8 _,nonce:Arr u8 _,now:i64,skew:i64,max_age:i64}
+sealed type OIDCIdentity = {ok:bool,subject:Arr u8 _,issuer:Arr u8 _,claims:Json,error:Error}
+private fn jwt_error(message:Arr u8 n)->JWTVerified
+  = JWTVerified {ok=false,claims=json_none().value,error=Error {code=13,message=message,position=0}}
+private fn jwt_decode(value:Arr u8 n)->BytesResult
+  = let decoded=base64url_decode(value) in
+    if n>0 && decoded.ok && str_equal(base64url_encode(decoded.value),value) then decoded else bytes_error(22,"Noncanonical JWT base64url",0)
+private fn jwt_text(value:Json,name:Arr u8 n,expected:Arr u8 m)->bool
+  = let text=json_text(json_get(value,name).value) in text.ok && str_equal(text.value,expected)
+private fn jwt_optional(value:Json,name:Arr u8 n,expected:Arr u8 m)->bool
+  = !json_get(value,name).present || jwt_text(value,name,expected)
+private fn jwt_key_ops(key:Json)->bool
+  = let ops=json_get(key,"key_ops") in !ops.present || ops.value.kind==5 && ops.value.count==1 && jwt_array_text(ops.value,0,"verify")
+private fn jwt_array_text(value:Json,index:i64,expected:Arr u8 n)->bool
+  = let text=json_text(json_array_get(value,index).value) in text.ok && str_equal(text.value,expected)
+fn jwt_verify_rs256(token:Arr u8 n,jwks:Arr u8 m)->JWTVerified
+  = if n<1 || n>32768 || m<1 || m>65536 then jwt_error("JWT or JWKS size limit") else
+    let first=str_find(token,".") in let tail=if first.present then str_slice(token,first.value+1,n) else "" in let second=str_find(tail,".") in
+    if !first.present || !second.present || str_find(str_slice(tail,second.value+1,len(tail)),".").present then jwt_error("Invalid compact JWT") else
+    let head=jwt_decode(str_slice(token,0,first.value)) in let body=jwt_decode(str_slice(tail,0,second.value)) in let signature=jwt_decode(str_slice(tail,second.value+1,len(tail))) in
+    if !head.ok || !body.ok || !signature.ok then jwt_error("Invalid JWT encoding") else
+    let header=json_parse(head.value) in let claims=json_parse(body.value) in let keys=json_parse(jwks) in let array=json_get(keys.value,"keys").value in
+    if !header.ok || header.value.count>32 || !json_object_unique(header.value) || !claims.ok || claims.value.count>128 || !json_object_unique(claims.value) ||
+      !keys.ok || keys.value.count>8 || !json_object_unique(keys.value) || array.kind!=5 || array.count<1 || array.count>32 then jwt_error("Invalid JWT objects or key set") else
+    let kid=json_text(json_get(header.value,"kid").value) in
+    if !jwt_text(header.value,"alg","RS256") || !jwt_optional(header.value,"typ","JWT") || !kid.ok || len(kid.value)<1 || len(kid.value)>256 ||
+      json_get(header.value,"crit").present || json_get(header.value,"b64").present || json_get(header.value,"jku").present || json_get(header.value,"jwk").present || json_get(header.value,"x5u").present then jwt_error("Unsupported JWT header") else
+    let matches=loop(i=0,count=0) while i<array.count next(i+1,count+(if jwt_text(json_array_get(array,i).value,"kid",kid.value) then 1 else 0)) yield count in
+    if matches!=1 then jwt_error("JWT signing key is missing or ambiguous") else
+    let key=loop(i=0,found=json_none().value) while i<array.count next(i+1,let entry=json_array_get(array,i).value in if jwt_text(entry,"kid",kid.value) then entry else found) yield found in
+    let modulus=jwt_decode(json_text(json_get(key,"n").value).value) in let exponent=jwt_decode(json_text(json_get(key,"e").value).value) in
+    if key.count>32 || !json_object_unique(key) || !jwt_text(key,"kty","RSA") || !jwt_optional(key,"use","sig") || !jwt_optional(key,"alg","RS256") || !jwt_key_ops(key) ||
+      json_get(key,"d").present || !modulus.ok || !exponent.ok || !str_equal(exponent.value,"\x01\x00\x01") then jwt_error("Unsupported JWT signing key") else
+    let public=rsa_public(modulus.value,65537) in
+    if !public.valid || !rsa_verify_sha256(public,str_slice(token,0,first.value+1+second.value),signature.value) then jwt_error("JWT signature verification failed") else
+    JWTVerified {ok=true,claims=claims.value,error=no_error()}
+private fn oidc_audience(claims:Json,audience:Arr u8 n)->bool
+  = let aud=json_get(claims,"aud").value in
+    let many=aud.kind==5 && aud.count>1 in
+    let matched=if aud.kind==4 then jwt_text(claims,"aud",audience) else aud.kind==5 && aud.count>=1 && aud.count<=16 &&
+      loop(i=0,ok=true,found=false) while ok && i<aud.count next(i+1,
+        let text=json_text(json_array_get(aud,i).value) in text.ok && len(text.value)>0,
+        found || jwt_array_text(aud,i,audience)) yield ok && found in
+    matched && (if many || json_get(claims,"azp").present then jwt_text(claims,"azp",audience) else true)
+fn oidc_verify(token:Arr u8 n,jwks:Arr u8 m,policy:OIDCValidation,access:Arr u8 a)->OIDCIdentity
+  = let url=url_parse_http(policy.issuer) in
+    let configured=url.ok && url.secure && !str_find(policy.issuer,"?").present && !str_find(policy.issuer,"#").present && len(policy.audience)>0 && len(policy.audience)<=512 &&
+      len(policy.nonce)>=16 && len(policy.nonce)<=512 && policy.now>0 && policy.now<=9223372036854775507 && policy.skew>=0 && policy.skew<=300 && policy.max_age>=1 && policy.max_age<=86400 in
+    let verified=if configured then jwt_verify_rs256(token,jwks) else jwt_error("Invalid OIDC validation policy") in let claims=verified.claims in
+    let subject=json_text(json_get(claims,"sub").value) in let exp=json_int(json_get(claims,"exp").value) in let iat=json_int(json_get(claims,"iat").value) in let nbf=json_int(json_get(claims,"nbf").value) in
+    let hash=json_get(claims,"at_hash") in
+    let valid=verified.ok && subject.ok && len(subject.value)>=1 && len(subject.value)<=256 && !str_find(subject.value,"\0").present &&
+      jwt_text(claims,"iss",policy.issuer) && oidc_audience(claims,policy.audience) && jwt_text(claims,"nonce",policy.nonce) &&
+      exp.ok && iat.ok && iat.value>0 && exp.value>iat.value && exp.value>policy.now-policy.skew && iat.value<=policy.now+policy.skew && iat.value>=policy.now-policy.max_age-policy.skew &&
+      (!json_get(claims,"nbf").present || nbf.ok && nbf.value<=policy.now+policy.skew) &&
+      (!hash.present || a>0 && jwt_text(claims,"at_hash",base64url_encode(str_slice(sha256(access),0,16)))) in
+    OIDCIdentity {ok=valid,subject=if valid then subject.value else "",issuer=if valid then policy.issuer else "",claims=if valid then claims else json_none().value,
+      error=if valid then no_error() else if !verified.ok then verified.error else Error {code=13,message="OIDC claims validation failed",position=0}}

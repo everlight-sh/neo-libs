@@ -1,0 +1,72 @@
+import "../web-security/src/lib.neo"
+import "../web-cache/src/lib.neo"
+import "std:pbkdf2"
+
+effect fn main() -> unit
+  = let key="0123456789abcdef0123456789abcdef" in
+    let token=web_session_create("test-user",key,1000,5000) in check token.ok in
+    let session=web_session_verify(token.value,key,1001) in
+    check session.authenticated && str_equal(session.subject,"test-user") && len(session.csrf)>0 in
+    check !web_session_verify(token.value,key,6000).authenticated && !web_session_verify(concat(token.value,"x"),key,1001).authenticated in
+    check !web_session_verify(token.value,"wrong-key",1001).authenticated in
+    let raw=concat("POST /items HTTP/1.1\r\nOrigin: https://app.test\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n_csrf=",session.csrf) in
+    check web_csrf(web_request(raw,1001),session,"https://app.test") && !web_csrf(web_request(raw,1001),session,"https://evil.test") in
+    let cookie=web_session_cookie(web_reply(200,"ok","text/plain"),token.value,3600,true) in
+    check str_find(cookie.headers,"HttpOnly; SameSite=Lax").present && str_find(cookie.headers,"; Secure").present in
+    let derived=pbkdf2_sha256("password","salt",2,32) in check derived.ok && str_equal(base64_encode(derived.value),"rk0Mla9rRtMtCt/5KPBt0CowP47zwlHf1uLYWpVHTEM=") in
+    let cache=web_cache_new(cli_arg(1).value) in let written=web_cache_write(cache,"key","cached-value",1000,500) in check written.ok in
+    let hit=web_cache_read(cache,"key",1200) in let expired=web_cache_read(cache,"key",1500) in check str_equal(hit.value,"cached-value") && !expired.present in
+    let invalidated=web_cache_invalidate(cache,"key") in let missing=web_cache_read(cache,"key",1200) in check invalidated.ok && !missing.present in
+    ; v2 tokens carry their issue time; v1 tokens still verify, issued at 0.
+    check session.issued==1000 && str_starts(token.value,"v2.") in
+    let v1=concat("v1.",base64url_encode("old-user"),".",base64url_encode(key),".5000") in
+    let old=web_session_verify(concat(v1,".",base64url_encode(hmac_sha256(key,v1))),key,1001) in
+    check old.authenticated && str_equal(old.subject,"old-user") && old.issued==0 in
+    ; Revocation ends sessions issued before it, not ones created at or after it.
+    let sessions=concat(cli_arg(1).value,"/sessions") in
+    let unrevoked=web_session_current(session,sessions) in let nowhere=web_session_current(session,"") in
+    check unrevoked.authenticated && !nowhere.authenticated in
+    let revoked=web_session_revoke(sessions,"test-user",2000) in check revoked.ok in
+    let later=web_session_create("test-user",key,2000,5000) in check later.ok in
+    let ended=web_session_current(session,sessions) in let kept=web_session_current(web_session_verify(later.value,key,2001),sessions) in
+    check !ended.authenticated && kept.authenticated in
+    let backwards=web_session_revoke(sessions,"test-user",1500) in let still=web_session_current(session,sessions) in
+    check backwards.ok && !still.authenticated in
+    let other=web_session_revoke(sessions,"old-user",1) in let old_ended=web_session_current(old,sessions) in
+    check other.ok && !old_ended.authenticated in
+    let current=web_session_read(web_request(concat("GET / HTTP/1.1\r\nCookie: neokit_session=",later.value,"\r\n\r\n"),2001),key,sessions) in
+    let stale_cookie=web_session_read(web_request(concat("GET / HTTP/1.1\r\nCookie: neokit_session=",token.value,"\r\n\r\n"),1001),key,sessions) in
+    check current.authenticated && str_equal(current.subject,"test-user") && !stale_cookie.authenticated in
+    ; A one-slot cache keeps only the latest key, rejects oversized values and
+    ; never lets an invalidation of an evicted key remove its replacement.
+    let small=web_cache_new_bounded(concat(cli_arg(1).value,"/small"),1,16) in
+    let a=web_cache_write(small,"a","first",1000,500) in let b=web_cache_write(small,"b","second",1000,500) in check a.ok && b.ok in
+    let evicted=web_cache_read(small,"a",1100) in let latest=web_cache_read(small,"b",1100) in
+    check !evicted.present && str_equal(latest.value,"second") in
+    let big=web_cache_write(small,"c","seventeen bytes!!",1000,500) in check !big.ok in
+    let stale=web_cache_invalidate(small,"a") in let survived=web_cache_read(small,"b",1100) in check stale.ok && survived.present in
+    check !web_cache_new_bounded("",4,4).enabled && !web_cache_new_bounded("x",0,4).enabled && !web_cache_new_bounded("x",4,8388609).enabled in
+    ; The sweep removes expired slots only.
+    let many=web_cache_new_bounded(concat(cli_arg(1).value,"/swept"),64,1024) in
+    let w1=web_cache_write(many,"short","x",1000,100) in let w2=web_cache_write(many,"long","y",1000,10000) in check w1.ok && w2.ok in
+    let none=web_cache_sweep(many,1050) in check none.ok && none.value==0 in
+    let one=web_cache_sweep(many,1200) in let long=web_cache_read(many,"long",1200) in
+    check one.ok && one.value==1 && str_equal(long.value,"y") in
+    ; Tag generations live outside the slots.
+    let tagged=web_cache_tagged_key(small,"page","catalog",1000) in let bumped=web_cache_invalidate_tag(small,"catalog",1000) in
+    let retagged=web_cache_tagged_key(small,"page","catalog",1001) in let untouched=web_cache_read(small,"b",1100) in
+    check bumped.ok && !str_equal(tagged,retagged) && str_equal(untouched.value,"second") in
+    ; Per-client limits: separate counters per address, one per IPv6 /64.
+    let limits=concat(cli_arg(1).value,"/limits") in
+    let first=web_ip_parse("192.0.2.1") in let second=web_ip_parse("198.51.100.7") in
+    let r1=web_rate_limit_address(limits,first,1000,2,1000) in let r2=web_rate_limit_address(limits,first,1001,2,1000) in
+    let r3=web_rate_limit_address(limits,first,1002,2,1000) in let r4=web_rate_limit_address(limits,second,1002,2,1000) in
+    let r5=web_rate_limit_address(limits,first,2001,2,1000) in
+    check r1 && r2 && !r3 && r4 && r5 in
+    let v1a=web_rate_limit_address(limits,web_ip_parse("2001:db8::1"),1000,1,1000) in
+    let v1b=web_rate_limit_address(limits,web_ip_parse("2001:db8::ffff:2"),1000,1,1000) in
+    let v2a=web_rate_limit_address(limits,web_ip_parse("2001:db8:0:1::1"),1000,1,1000) in
+    let bad=web_rate_limit_address(limits,"bad",1000,1,1000) in
+    let anonymous=web_rate_limit_client(web_request("GET / HTTP/1.1\r\n\r\n",1000),limits,1000,1,1000) in
+    check v1a && !v1b && v2a && !bad && anonymous in
+    let printed=print_out("Web security, sessions, rate limits, PBKDF2 and cache OK\n") in noop()

@@ -1,0 +1,22 @@
+import "std:process"
+import "std:json"
+import "pkg:mcp" as mcp
+import "std:arena"
+import "std:io"
+import "std:debug"
+private fn one(text:Arr u8 _) -> Arr Arr u8 _ _ = arr(i in 0..1) text
+private fn none() -> Arr Arr u8 _ _ = arr(i in 0..0) ""
+private effect(fs,net,env,time,process) fn exercise(executable:Arr u8 _,script:Arr u8 _) -> unit
+  = using arena=new_arena(8) in using child=process_start(executable,one(script),none()) in let process=adopt(child,arena) in
+    using cancellation=new_cancellation() in let cancel_ref=adopt(cancellation,arena) in
+    let transport=mcp::mcp_process_transport(process,cancel_ref) in let timer=deadline_after(3000) in
+    let initialized=mcp::mcp_initialize(mcp::mcp_new(transport),timer.value) in check initialized.ok in
+    let list=mcp::mcp_tools_list(initialized.state,"",timer.value) in check list.ok in
+    let tools=json_get(list.result,"tools") in check tools.value.kind==5 && json_array_len(tools.value)==1 in
+    let reply=mcp::mcp_tools_call(list.state,"add",json_parse("{\"a\":20,\"b\":22}").value,timer.value) in
+    check reply.ok in let text=print_out(concat(json_encode(reply.result),"\n")) in
+    let null=mcp::mcp_request(reply.state,"ping",json_parse("{}").value,timer.value) in check null.ok && null.result.kind==1 in
+    let failed=mcp::mcp_tools_call(null.state,"missing",json_parse("{}").value,timer.value) in check !failed.ok && failed.rpc_error.kind==6 in noop()
+effect(fs,net,env,time,process) fn main() -> unit
+  = let baseline=live_resources() in let checked=exercise(cli_arg(1).value,cli_arg(2).value) in
+    let live=live_resources() in check live==baseline in let out=print_out("MCP OK\n") in noop()

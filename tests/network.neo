@@ -1,0 +1,50 @@
+import "std:option"
+import "pkg:http-client" as pool
+import "pkg:http-server" as server
+import "std:https_client"
+import "std:io"
+import "std:debug"
+private fn no_headers() -> Arr HttpHeader _ = arr(i in 0..0) HttpHeader { name="",value="" }
+private effect(fs,net,time,process) fn drain<C>(io:HttpIO<C>,move reader:HttpReader,deadline:i64) -> HttpReader
+  = loop(r=reader) while r.ok && !r.done next(let piece=http_read_next_io(io,r,deadline) in let output=print_out(piece.chunk) in piece) yield r
+private effect(fs,net,time,process) fn keepalive(port:i64) -> unit
+  = using arena=new_arena(4) in using cancellation=new_cancellation() in let cancel_ref=adopt(cancellation,arena) in
+    let timer=deadline_after(3000) in using socket=tcp_connect_ipv4_cancel("127.0.0.1",port,timer.value,borrow_ref(cancel_ref)) in
+    let status=socket_status(socket) in check status.ok in let socket_ref=adopt(socket,arena) in let io=http_plain_transport(socket_ref,cancel_ref) in
+    let first=http_start_keepalive_io(io,"GET","/first","localhost","",timer.value,1024,no_headers()) in check first.ok in
+    let complete=drain(io,first,timer.value) in check complete.ok && http_reader_reusable(complete) in
+    let now=monotonic_ms() in let cached=pool::http_pool_put(pool::http_pool_new::<PlainHTTPCapture>(2,1000),pool::PooledHTTP::<PlainHTTPCapture> { origin="http://localhost:80",io=io,idle_since=now.value },complete) in check cached.accepted in
+    let leased=pool::http_pool_take(cached.pool,"http://localhost:80",now.value) in
+    match leased.entry { None => check false in noop(),Some(connection) =>
+      let second=http_start_keepalive_io(connection.io,"GET","/second","localhost","",timer.value,1024,no_headers()) in check second.ok in
+      let complete=drain(connection.io,second,timer.value) in check complete.ok && !http_reader_reusable(complete) in noop() }
+private effect(fs,net,time,process) fn streaming(port:i64) -> unit
+  = using cancellation=new_cancellation() in using listener=tcp_listen_ipv4("127.0.0.1",port,16) in let status=listener_status(listener) in check status.ok in
+    let output=print_out("listening\n") in let timer=deadline_after(4000) in using socket=listener_accept(listener,timer.value,cancellation) in
+    let status=socket_status(socket) in check status.ok in
+    using arena=new_arena(4) in let cancel_ref=adopt(cancellation,arena) in let socket_ref=adopt(socket,arena) in
+    let io=http_plain_transport(socket_ref,cancel_ref) in let read=io.read in let request=read(io.context,timer.value) in check request.ok in
+    let first=server::http_stream_begin(io,server::http_stream_new(),"text/event-stream",no_headers(),timer.value) in check first.ok in
+    let event=server::sse_encode("message","first","1") in check event.ok in
+    let written=server::http_stream_write(io,first.state,event.value,timer.value) in check written.ok in
+    let slept=sleep_ms(300) in let last=server::http_stream_end(io,written.state,timer.value) in check last.ok in noop()
+private effect(fs,net,time,process) fn cancellation_test(port:i64,mode:i64,root:Arr u8 _) -> unit
+  = using cancellation=new_cancellation() in let timer=deadline_after(4000) in
+    if mode==3 then
+      let child=process_fork() in if child.ok && child.value==0 then let slept=sleep_ms(30) in let stopped=cancel(cancellation) in process_exit(0) else
+      let reply=dns_lookup_at_cancel("example.test","127.0.0.1",port,timer.value,cancellation) in
+      let waited=process_wait(child.value) in let out=print_out(concat("error:",int_text(reply.error.code))) in noop() else
+    using socket=tcp_connect_ipv4_cancel("127.0.0.1",port,timer.value,cancellation) in let status=socket_status(socket) in check status.ok in
+    let cert=fs_read(root) in check cert.ok in let roots=arr(i in 0..1) x509_parse(cert.value) in
+    if mode==2 then
+      let child=process_fork() in if child.ok && child.value==0 then let slept=sleep_ms(30) in let stopped=cancel(cancellation) in process_exit(0) else
+      using session=tls_connect_cancel(socket,"localhost",roots,timer.value,cancellation) in
+      let status=tls_status(session) in let waited=process_wait(child.value) in let out=print_out(concat("error:",int_text(status.error.code))) in noop() else
+    using session=tls_connect_cancel(socket,"localhost",roots,timer.value,cancellation) in let status=tls_status(session) in check status.ok in
+    let child=process_fork() in if child.ok && child.value==0 then let slept=sleep_ms(30) in let stopped=cancel(cancellation) in process_exit(0) else
+      let read=tls_read(socket,session,timer.value) in let waited=process_wait(child.value) in let out=print_out(concat("error:",int_text(read.error.code))) in noop()
+effect(fs,net,time,process,env) fn main() -> unit
+  = let port=int_parse(cli_arg(1).value) in let mode=int_parse(cli_arg(2).value) in check port.ok && mode.ok in
+    let baseline=live_resources() in
+    let done=if mode.value==0 then keepalive(port.value) else if mode.value==1 then streaming(port.value) else cancellation_test(port.value,mode.value,cli_arg(3).value) in
+    let live=live_resources() in check live==baseline in noop()

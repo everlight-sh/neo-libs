@@ -1,0 +1,18 @@
+import "pkg:html" as html
+import "std:io"
+
+; Tokenizes stdin and prints one token per line for test_html.py: kind, name,
+; text and the self-closing flag, then one name=value field per attribute.
+; Every byte string is hex-encoded so the oracle can compare exact bytes.
+fn hex(text:Arr u8 n) -> Arr u8 _
+  = arr(i in 0..2*n) let b=str_byte(text,i/2) in let d=if i%2==0 then b/16 else b%16 in u8(if d<10 then 48+d else 87+d)
+fn attributes(token:html::HtmlToken) -> Arr u8 _
+  = let list=token.attributes in
+    loop(i=0,out="") while i<len(list) next(i+1,check i>=0 && i<len(list) in concat(out,"\t",hex(list[i].name),"=",hex(list[i].value))) yield out
+fn line(token:html::HtmlToken) -> Arr u8 _
+  = concat(int_text(token.kind),"\t",hex(token.name),"\t",hex(token.text),"\t",if token.self_closing then "1" else "0",attributes(token),"\n")
+effect(fs) fn main() -> unit
+  = let raw=file_read(0,16777216) in check raw.ok in
+    let tokens=html::html_tokens(raw.value) in
+    let out=loop(i=0,out="") while i<len(tokens) next(i+1,check i>=0 && i<len(tokens) in concat(out,line(tokens[i]))) yield out in
+    let printed=print_out(out) in noop()

@@ -1,0 +1,20 @@
+import "std:pbkdf2"
+import "std:base64"
+
+type PGScram = {ok:bool,proof:Arr u8 _,signature:Arr u8 _}
+fn pg_scram_field(message:Arr u8 n,name:Arr u8 m) -> OptionBytes
+  = loop(at=0,out=none_bytes(),count=0) while at<n next(
+      let comma=str_find(str_slice(message,at,n),",") in if comma.present then at+comma.value+1 else n,
+      let comma=str_find(str_slice(message,at,n),",") in let field=str_slice(message,at,if comma.present then at+comma.value else n) in
+      if str_starts(field,concat(name,"=")) then some_bytes(str_slice(field,m+1,len(field))) else out,
+      let comma=str_find(str_slice(message,at,n),",") in let field=str_slice(message,at,if comma.present then at+comma.value else n) in count+(if str_starts(field,concat(name,"=")) then 1 else 0)) yield if count==1 then out else none_bytes()
+fn pg_scram_proof(password:Arr u8 n,nonce:Arr u8 m,bare:Arr u8 k,challenge:Arr u8 q) -> PGScram
+  = let server_nonce=pg_scram_field(challenge,"r") in let salt=base64_decode(pg_scram_field(challenge,"s").value) in let iterations=int_parse(pg_scram_field(challenge,"i").value) in
+    if !server_nonce.present || !str_starts(server_nonce.value,nonce) || len(server_nonce.value)<=m || len(server_nonce.value)>1024 || !salt.ok || len(salt.value)<8 || len(salt.value)>1024 || !iterations.ok || iterations.value<4096 || iterations.value>1000000 || pg_scram_field(challenge,"m").present then PGScram {ok=false,proof="",signature=""} else
+    let salted=pbkdf2_sha256(password,salt.value,iterations.value,32) in
+    if !salted.ok then PGScram {ok=false,proof="",signature=""} else
+    let client_key=hmac_sha256(salted.value,"Client Key") in let stored=sha256(client_key) in let server_key=hmac_sha256(salted.value,"Server Key") in
+    let final=concat("c=biws,r=",server_nonce.value) in let message=concat(bare,",",challenge,",",final) in
+    let signature=hmac_sha256(stored,message) in let count=len(client_key) in
+    let proof=arr(i in 0..count) check i>=0 && i<len(signature) in u8(bit_xor(i64(client_key[i]),i64(signature[i]))) in
+    PGScram {ok=true,proof=concat(final,",p=",base64_encode(proof)),signature=base64_encode(hmac_sha256(server_key,message))}

@@ -1,0 +1,19 @@
+import "pkg:dom" as dom
+import "std:io"
+
+; Parses stdin and prints, for the selector in argument 1, the tree-order
+; position of every matching element (counting elements only), or "error".
+effect(fs,env) fn main() -> unit
+  = let raw=file_read(0,16777216) in check raw.ok in
+    let tree=dom::dom_parse(raw.value) in
+    let css=dom::css_parse(cli_arg(1).value) in
+    let out=if !css.ok then concat("error ",css.error,"\n") else
+      let hits=dom::dom_query_all(tree,0,css) in
+      let walk=loop(i=dom::dom_following(tree,0,0),ordinal=0,next_hit=0,acc="") while i>=0
+        next(dom::dom_following(tree,0,i),
+          if dom::dom_kind(tree,i)==1 then ordinal+1 else ordinal,
+          if next_hit<len(hits) && (check next_hit>=0 in hits[next_hit])==i then next_hit+1 else next_hit,
+          if next_hit<len(hits) && (check next_hit>=0 in hits[next_hit])==i then concat(acc,int_text(ordinal)," ") else acc)
+        yield acc in
+      concat(walk,"\n") in
+    let printed=print_out(out) in noop()

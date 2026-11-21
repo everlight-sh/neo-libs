@@ -1,0 +1,85 @@
+{
+  "format": 1,
+  "date": "2026-10-25",
+  "native_macos": {
+    "unit_tests": 101,
+    "native_cases": 36,
+    "complete_language_integration": "passed",
+    "library_suite_tests": 40,
+    "offline_packaging_tests": 1
+  },
+  "native_linux_arm64": {
+    "unit_tests": 101,
+    "native_cases": 36,
+    "complete_language_integration": "passed",
+    "library_suite_tests": 40,
+    "offline_packaging_tests": 1,
+    "elf_audit_binaries": 12,
+    "binary_only_empty_root_cases": 5
+  },
+  "emulated_linux_x86_64": {
+    "runner": "VM binfmt QEMU, QEMU_RESERVED_VA=4G",
+    "media_tests": 6,
+    "srtp_srtcp_tests": 5,
+    "p256_rfc6979_ecdh_ecdsa_go_interop": "passed",
+    "native_performance_claim": false,
+    "automatic_guest_placement": "intermittent failures observed; passing results use explicit reservation; no Neo change made"
+  },
+  "full_scope_ready": false,
+  "logs": {
+    "language_macos": {
+      "checkout": "neo",
+      "path": ".kernel-build/agent-library-final-macos.log",
+      "sha256": "e4b26ede074cb1728480009051bc256e01c1266848f85561c611e2c75c618412",
+      "passed": true
+    },
+    "language_linux": {
+      "checkout": "neo",
+      "path": ".kernel-build/agent-library-final-linux.log",
+      "sha256": "a07301a788d2b2eeafe06af4feed27bc48db5500b9a52ce297c352bc32e7d547",
+      "passed": true
+    },
+    "libraries_macos": {
+      "checkout": "neo-libs",
+      "path": "build/libraries-final-macos.log",
+      "sha256": "2b03d1c9315be5f5e045e21dff6fbc7d720827366849c716422d31748f475017",
+      "passed": true
+    },
+    "libraries_linux": {
+      "checkout": "neo-libs",
+      "path": "build/libraries-final-linux.log",
+      "sha256": "7a420eedc76161232c31267a1f6e66f0858fb96831b5d36665bc57c5ed473da8",
+      "passed": true
+    },
+    "packaging_macos": {
+      "checkout": "neo-libs",
+      "path": "build/packaging-final-macos.log",
+      "sha256": "03733f5bffa760dabce7e0a98d9dcc2884fe50b8353bf0cdf37ad57f405a6618",
+      "passed": true
+    },
+    "packaging_linux": {
+      "checkout": "neo-libs",
+      "path": "build/packaging-final-linux.log",
+      "sha256": "69e19b3f14478f09985e45707b8913ffbf520e776c2ec8c8e5f720fe0cae7803",
+      "passed": true
+    },
+    "media_x86_emulated": {
+      "checkout": "neo-libs",
+      "path": "build/media-x86_64-emulated.log",
+      "sha256": "74d7ab2e896575a41bc3d3f0e625c02b1d2209ec27a54e89eb7c5ef3ff15cfd2",
+      "passed": true
+    },
+    "srtp_x86_emulated": {
+      "checkout": "neo-libs",
+      "path": "build/srtp-x86_64-emulated.log",
+      "sha256": "acc99cbe3d748ad55da4cf354e516f1952ec977c1bad0ad80f9d61f84e04c761",
+      "passed": true
+    },
+    "p256_x86_emulated": {
+      "checkout": "neo",
+      "path": ".kernel-build/p256-x86_64-emulated.log",
+      "sha256": "8d459cffedb658d7e92543bb8e06d297787b27955a3e3bed76fa1b85b5b81819",
+      "passed": true
+    }
+  }
+}

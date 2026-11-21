@@ -1,0 +1,24 @@
+import "../postgres/src/lib.neo"
+import "std:socket_transport"
+effect fn main(port:i64)->unit
+  = using cancellation=new_cancellation() in let deadline=deadline_after(15000) in
+    using socket=tcp_connect_ipv4("127.0.0.1",port,deadline.value) in let status=socket_status(socket) in check status.ok in
+    using arena=new_arena(4) in let cancel_ref=adopt(cancellation,arena) in let socket_ref=adopt(socket,arena) in
+    let connection=pg_connect(http_plain_transport(socket_ref,cancel_ref),"test","test","pencil",false,deadline.value) in check connection.ok in
+    let empty=arr(i in 0..0) pg_null() in
+    let setup=pg_query(connection,"CREATE TEMP TABLE neo_rows (id bigint PRIMARY KEY, value text, absent text)",empty,deadline.value) in check setup.ok in
+    let value="x'); DROP TABLE neo_rows; -- café 🚀" in
+    let insert=pg_execute(setup.connection,pg_insert("neo_rows",arr(i in 0..3) if i==0 then pg_field("id",pg_int(9223372036854775807)) else if i==1 then pg_field("value",pg_text(value)) else pg_field("absent",pg_null())),deadline.value) in check insert.ok && insert.rows.count==1 in
+    let row=json_array_get(insert.rows,0).value in check str_equal(json_text(json_get(row,"id").value).value,"9223372036854775807") && str_equal(json_text(json_get(row,"value").value).value,value) && json_get(row,"absent").value.kind==1 in
+    let selected=pg_execute(insert.connection,pg_select("neo_rows",arr(i in 0..2) if i==0 then "value" else "absent",arr(i in 0..1) pg_field("absent",pg_null()),10),deadline.value) in check selected.ok && selected.rows.count==1 in
+    let updated=pg_execute(selected.connection,pg_update("neo_rows",arr(i in 0..1) pg_field("value",pg_text("Updated café")),arr(i in 0..1) pg_field("id",pg_int(9223372036854775807))),deadline.value) in check updated.ok && updated.rows.count==1 in
+    let failed=pg_query(updated.connection,"SELECT 1/0",empty,deadline.value) in check !failed.ok && failed.connection.ok in
+    let large=pg_query(failed.connection,"SELECT $1::text AS value, NULL::text AS absent",arr(i in 0..1) pg_text(arr(j in 0..100000) u8(97+j%26)),deadline.value) in check large.ok in
+    check len(json_text(json_get(json_array_get(large.rows,0).value,"value").value).value)==100000 in
+    let begin=pg_query(large.connection,"BEGIN",empty,deadline.value) in check begin.ok in
+    let rejected=pg_pool_put(pg_pool::<PlainHTTPCapture>(1,1000),begin.connection,1000) in check !rejected.accepted in
+    let rollback=pg_query(begin.connection,"ROLLBACK",empty,deadline.value) in check rollback.ok in
+    let removed=pg_execute(rollback.connection,pg_delete("neo_rows",arr(i in 0..1) pg_field("id",pg_int(9223372036854775807))),deadline.value) in check removed.ok && removed.rows.count==1 in
+    let count=pg_query(removed.connection,"SELECT count(*) AS count FROM neo_rows",empty,deadline.value) in check count.ok && str_equal(json_text(json_get(json_array_get(count.rows,0).value,"count").value).value,"0") in
+    let accepted=pg_pool_put(pg_pool::<PlainHTTPCapture>(1,1000),count.connection,1000) in check accepted.accepted in
+    let printed=print_out("PASS real PostgreSQL: SCRAM, parameterized CRUD, Unicode, NULL, int64, 100KB result, SQL recovery, transaction pool guard\n") in noop()

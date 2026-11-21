@@ -1,0 +1,34 @@
+import "std:json"
+import "std:transport"
+import "std:http"
+import "std:sse"
+
+; Explicit streaming writer over any HttpIO transport. Each chunk write reaches
+; the transport immediately and inherits its deadline/cancellation/backpressure.
+sealed type HTTPStream = { started:bool,done:bool,failed:bool,bytes:i64 }
+type HTTPWrite = { state:HTTPStream,ok:bool,error:Error }
+fn http_stream_new() -> HTTPStream = HTTPStream { started=false,done=false,failed=false,bytes=0 }
+private fn http_stream_failure(move state:HTTPStream,code:i64,message:Arr u8 _) -> HTTPWrite
+  = HTTPWrite { state=state with { failed=true },ok=false,error=Error { code=code,message=message,position=state.bytes } }
+private fn stream_headers(headers:Arr HttpHeader n) -> BytesResult
+  = http_headers_encode(headers)
+effect(net,time,process) fn http_stream_begin<C>(io:HttpIO<C>,move state:HTTPStream,content_type:Arr u8 n,headers:Arr HttpHeader h,deadline:i64) -> HTTPWrite
+  = let extra=stream_headers(headers) in
+    if state.started || state.failed || state.done || !http_field_value(content_type) || n==0 || !extra.ok then http_stream_failure(state,22,"invalid streaming response headers or state") else
+    let bytes=concat("HTTP/1.1 200 OK\r\nContent-Type: ",content_type,"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",extra.value,"\r\n") in
+    let write=io.write in let sent=write(io.context,bytes,deadline) in
+    if !sent.ok || sent.value!=len(bytes) then http_stream_failure(state,if sent.ok then 5 else sent.error.code,"stream header write failed") else
+      HTTPWrite { state=state with { started=true },ok=true,error=no_error() }
+private fn stream_hex(number:i64) -> Arr u8 _
+  = if number<16 then str_slice("0123456789abcdef",number,number+1) else concat(stream_hex(number/16),str_slice("0123456789abcdef",number%16,number%16+1))
+effect(net,time,process) fn http_stream_write<C>(io:HttpIO<C>,move state:HTTPStream,body:Arr u8 n,deadline:i64) -> HTTPWrite
+  = if !state.started || state.done || state.failed || n>16777216 || state.bytes>1073741824-n then http_stream_failure(state,22,"invalid streaming response write") else
+    if n==0 then HTTPWrite { state=state,ok=true,error=no_error() } else
+    let bytes=concat(stream_hex(n),"\r\n",body,"\r\n") in let write=io.write in let sent=write(io.context,bytes,deadline) in
+    if !sent.ok || sent.value!=len(bytes) then http_stream_failure(state,if sent.ok then 5 else sent.error.code,"stream body write failed") else
+      HTTPWrite { state=state with { bytes=state.bytes+n },ok=true,error=no_error() }
+effect(net,time,process) fn http_stream_end<C>(io:HttpIO<C>,move state:HTTPStream,deadline:i64) -> HTTPWrite
+  = if !state.started || state.done || state.failed then http_stream_failure(state,22,"invalid streaming response end") else
+    let write=io.write in let sent=write(io.context,"0\r\n\r\n",deadline) in
+    if !sent.ok || sent.value!=5 then http_stream_failure(state,if sent.ok then 5 else sent.error.code,"stream final write failed") else
+      HTTPWrite { state=state with { done=true },ok=true,error=no_error() }

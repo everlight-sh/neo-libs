@@ -1,0 +1,87 @@
+import "std:fs"
+import "std:sha256"
+import "std:base64"
+
+; Atomic cross-worker disk cache with bounded values and explicit expiration.
+; Entries live in a fixed set of slot files picked by key hash, so the directory
+; holds at most `slots` entries (plus one file per tag and the queue file) and
+; at most about slots x max_value bytes. A key whose slot is taken by another
+; key replaces it; the evicted key then misses. web_cache_sweep removes expired
+; entries.
+sealed type WebCache = { directory:Arr u8 _,enabled:bool,slots:i64,max_value:i64 }
+fn web_cache_new(directory:Arr u8 n) -> WebCache = web_cache_new_bounded(directory,4096,8388608)
+; At most `slots` (1..1048576) entries of at most `max_value` (1..8388608) bytes.
+fn web_cache_new_bounded(directory:Arr u8 n,slots:i64,max_value:i64) -> WebCache
+  = let valid=n>0 && io_path_valid(directory) && slots>=1 && slots<=1048576 && max_value>=1 && max_value<=8388608 in
+    WebCache { directory=directory,enabled=valid,slots=if valid then slots else 1,max_value=if valid then max_value else 0 }
+private fn cache_slot_path(cache:WebCache,index:i64) -> Arr u8 _ = concat(cache.directory,"/slot-",int_text(index))
+private fn cache_key_path(cache:WebCache,hash:Arr u8 n) -> Arr u8 _
+  = let number=str_byte(hash,0)*16777216+str_byte(hash,1)*65536+str_byte(hash,2)*256+str_byte(hash,3) in
+    cache_slot_path(cache,if cache.slots<1 || number<0 then 0 else number%cache.slots)
+; Tags never share a slot: evicting a tag would bring back an old generation.
+private fn cache_tag_path(cache:WebCache,id:Arr u8 n) -> Arr u8 _ = concat(cache.directory,"/tag-",id)
+; An entry file is the expiry, "\n", the base64url SHA-256 of its key, "\n", the value.
+private fn cache_holds(raw:Arr u8 n,id:Arr u8 m) -> bool
+  = let line=str_find(raw,"\n") in line.present && line.value+m+1<n &&
+    str_equal(str_slice(raw,line.value+1,line.value+m+1),id) && str_byte(raw,line.value+m+1)==10
+private fn cache_value(raw:Arr u8 n,id:Arr u8 m,now:i64) -> OptionBytes
+  = let line=str_find(raw,"\n") in let expiry=int_parse(str_slice(raw,0,if line.present then line.value else 0)) in
+    if !cache_holds(raw,id) || !expiry.ok || expiry.value<=now then none_bytes() else some_bytes(str_slice(raw,line.value+m+2,n))
+private effect(fs) fn cache_load(path:Arr u8 n,id:Arr u8 m,now:i64) -> OptionBytes
+  = let raw=fs_read(path) in if !raw.ok then none_bytes() else cache_value(raw.value,id,now)
+private effect(fs,process) fn cache_store(cache:WebCache,path:Arr u8 n,id:Arr u8 m,value:Arr u8 k,now:i64,ttl:i64) -> IntResult
+  = if !cache.enabled || now<0 || ttl<1 || ttl>2592000000 || now>9223372036854775807-ttl || k>8388608 then int_error(22,"invalid cache entry",0) else
+    let directory=fs_mkdir(cache.directory) in fs_atomic_replace(path,concat(int_text(now+ttl),"\n",id,"\n",value))
+effect(fs) fn web_cache_read(cache:WebCache,key:Arr u8 n,now:i64) -> OptionBytes
+  = if !cache.enabled || now<0 then none_bytes() else let hash=sha256(key) in cache_load(cache_key_path(cache,hash),base64url_encode(hash),now)
+effect(fs,process) fn web_cache_write(cache:WebCache,key:Arr u8 n,value:Arr u8 m,now:i64,ttl:i64) -> IntResult
+  = if m>cache.max_value then int_error(22,"invalid cache entry",0) else
+    let hash=sha256(key) in cache_store(cache,cache_key_path(cache,hash),base64url_encode(hash),value,now,ttl)
+; Removes the key's slot file only while it still holds that key.
+effect(fs) fn web_cache_invalidate(cache:WebCache,key:Arr u8 n) -> IntResult
+  = if !cache.enabled then int_error(22,"cache disabled",0) else
+    let hash=sha256(key) in let path=cache_key_path(cache,hash) in let raw=fs_read(path) in
+    if !raw.ok then (if raw.error.code==2 then int_ok(0) else int_error(raw.error.code,raw.error.message,0)) else
+    if !cache_holds(raw.value,base64url_encode(hash)) then int_ok(0) else
+    let removed=fs_remove(path) in if !removed.ok && removed.error.code==2 then int_ok(0) else removed
+; Removes every slot whose entry has expired, reading only its first line, and
+; returns how many it removed. Run it periodically, for example from the
+; revalidation worker. A slot rewritten between the check and the removal is
+; lost too; that is a cache miss, never stale data.
+effect(fs) fn web_cache_sweep(cache:WebCache,now:i64) -> IntResult
+  = if !cache.enabled || now<0 then int_error(22,"invalid cache sweep",0) else
+    loop(i=0,removed=0) while i<cache.slots next(i+1,removed+cache_sweep_slot(cache_slot_path(cache,i),now)) yield int_ok(removed)
+private effect(fs) fn cache_sweep_slot(path:Arr u8 n,now:i64) -> i64
+  = let opened=file_open(path,0) in if !opened.ok then 0 else
+    let head=file_read_chunk(opened.value,32) in let closed=file_close(opened.value) in
+    let line=str_find(head.value,"\n") in let expiry=int_parse(str_slice(head.value,0,if line.present then line.value else 0)) in
+    if !head.ok || line.present && expiry.ok && expiry.value>now then 0 else
+    let removed=fs_remove(path) in if removed.ok then 1 else 0
+
+effect(fs) fn web_cache_tag(cache:WebCache,tag:Arr u8 n,now:i64) -> Arr u8 _
+  = let id=base64url_encode(sha256(tag)) in
+    let version=if cache.enabled && now>=0 then cache_load(cache_tag_path(cache,id),id,now) else none_bytes() in
+    if version.present then version.value else "0"
+effect(fs) fn web_cache_tagged_key(cache:WebCache,key:Arr u8 n,tag:Arr u8 m,now:i64) -> Arr u8 _
+  = let generation=web_cache_tag(cache,tag,now) in concat("entry:",tag,":",generation,":",key)
+effect(fs,process) fn web_cache_invalidate_tag(cache:WebCache,tag:Arr u8 n,now:i64) -> IntResult
+  = let random=random_bytes(16) in if !random.ok then int_error(random.error.code,random.error.message,0) else
+    let id=base64url_encode(sha256(tag)) in cache_store(cache,cache_tag_path(cache,id),id,base64url_encode(random.value),now,2592000000)
+
+; A bounded, durable revalidation queue. Work is idempotent GET rendering;
+; a worker crash may discard a drained batch, bounded by each entry's hard TTL.
+effect(fs,process) fn web_cache_enqueue(cache:WebCache,key:Arr u8 n,target:Arr u8 m,now:i64)->IntResult
+  = if !cache.enabled || m>4096 || !str_starts(target,"/") || str_find(target,"\r").present || str_find(target,"\n").present || str_find(target,"\0").present then int_error(22,"Invalid revalidation target",0) else
+    let pending=web_cache_read(cache,concat("pending:",key),now) in if pending.present then int_ok(0) else
+    let opened=file_open(concat(cache.directory,"/revalidate.queue"),3) in if !opened.ok then opened else
+    let locked=file_lock(opened.value,true) in let existing=if locked.ok then file_read(opened.value,1048576) else bytes_error(locked.error.code,locked.error.message,0) in
+    let written=if existing.ok && len(existing.value)+m+1<=1048576 then file_write(opened.value,concat(target,"\n")) else int_error(27,"Revalidation queue is full",0) in
+    let synced=if written.ok then file_sync(opened.value) else written in let closed=file_close(opened.value) in
+    if !synced.ok then synced else if !closed.ok then closed else web_cache_write(cache,concat("pending:",key),"queued",now,10000)
+effect(fs) fn web_cache_dequeue(cache:WebCache)->BytesResult
+  = if !cache.enabled then bytes_error(22,"Cache disabled",0) else
+    let opened=file_open(concat(cache.directory,"/revalidate.queue"),3) in if !opened.ok then bytes_error(opened.error.code,opened.error.message,0) else
+    let locked=file_lock(opened.value,true) in let jobs=if locked.ok then file_read(opened.value,1048576) else bytes_error(locked.error.code,locked.error.message,0) in
+    let cleared=if jobs.ok then file_truncate(opened.value,0) else int_error(jobs.error.code,jobs.error.message,0) in
+    let synced=if cleared.ok then file_sync(opened.value) else cleared in let closed=file_close(opened.value) in
+    if !synced.ok then bytes_error(synced.error.code,synced.error.message,0) else if !closed.ok then bytes_error(closed.error.code,closed.error.message,0) else jobs

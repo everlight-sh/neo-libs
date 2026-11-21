@@ -1,0 +1,25 @@
+import "../postgres/src/lib.neo"
+import "std:socket_transport"
+effect fn main(port:i64,mode:i64) -> unit
+  = using cancellation=new_cancellation() in let deadline=deadline_after(10000) in
+    using socket=tcp_connect_ipv4("127.0.0.1",port,deadline.value) in let status=socket_status(socket) in check status.ok in
+    using arena=new_arena(4) in let cancel_ref=adopt(cancellation,arena) in let socket_ref=adopt(socket,arena) in
+    let connection=pg_connect(http_plain_transport(socket_ref,cancel_ref),"test","test","pencil",false,deadline.value) in
+    if mode==1 then check !connection.ok in let returned=pg_pool_put(pg_pool::<PlainHTTPCapture>(1,1000),connection,1000) in check !returned.accepted in let printed=print_out("Rejected invalid server proof\n") in noop() else
+    check connection.ok in
+    let statement=pg_select("test_rows",arr(i in 0..2) if i==0 then "value" else "absent",arr(i in 0..2) if i==0 then pg_field("value",pg_text("x'); DROP TABLE users; -- café")) else pg_field("absent",pg_null()),10) in check statement.ok in
+    let invalid=pg_delete("test_rows",arr(i in 0..0) pg_field("",pg_null())) in
+    let skipped=pg_execute(connection,invalid,deadline.value) in check !skipped.ok && skipped.connection.ok in
+    let query=pg_execute(skipped.connection,statement,deadline.value) in
+    check query.ok in let printed=print_out(concat(json_encode(query.rows),"\n")) in
+    let query=pg_query(query.connection,"select 1/0",arr(i in 0..0) pg_null(),deadline.value) in check !query.ok && query.connection.ok in
+    let query=pg_query(query.connection,"select 42 as value",arr(i in 0..0) pg_null(),deadline.value) in check query.ok in
+    let returned=pg_pool_put(pg_pool::<PlainHTTPCapture>(1,1000),query.connection,1000) in check returned.accepted in
+    let leased=pg_pool_take(returned.pool,1500) in check vec_len(leased.expired)==0 in
+    let connection=match leased.connection {None=>query.connection,Some(value)=>value} in
+    check match leased.connection {None=>false,Some(value)=>value.ok} in
+    let returned=pg_pool_put(leased.pool,connection,1500) in check returned.accepted in
+    let expired=pg_pool_take(returned.pool,2600) in check vec_len(expired.expired)==1 in
+    check match expired.connection {None=>true,Some(value)=>false} in
+    let empty=pg_pool_take(expired.pool,2601) in check vec_len(empty.expired)==0 in
+    let printed=print_out(concat(json_encode(query.rows),"\n")) in noop()

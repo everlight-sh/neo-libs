@@ -1,0 +1,6 @@
+import "../jwt/src/lib.neo"
+import "std:io"
+effect fn main()->unit
+  = let token=fs_read(env_get("JWT_TOKEN_FILE").value) in let jwks=fs_read(env_get("JWT_JWKS_FILE").value) in check token.ok && jwks.ok in
+    let identity=oidc_verify(token.value,jwks.value,OIDCValidation {issuer="https://issuer.test",audience="test-client",nonce="test-nonce-at-least-16-bytes",now=2000000000,skew=30,max_age=3600},"opaque-access-token") in
+    let output=print_out(if identity.ok then concat("OK:",identity.subject,"\n") else concat("ERROR:",identity.error.message,"\n")) in noop()

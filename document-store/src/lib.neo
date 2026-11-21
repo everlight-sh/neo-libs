@@ -1,0 +1,23 @@
+import "std:fs"
+import "std:json"
+
+; Small embedded document database: flock serializes writers across workers;
+; atomic replacement + file/directory fsync commits a complete JSON document.
+; Readers see the old or new version. Maximum document size is 16 MiB.
+; Pure transactions may be retried by callers; callbacks perform no external I/O.
+sealed type DocumentStore = { path:Arr u8 _,valid:bool }
+fn document_store(path:Arr u8 n) -> DocumentStore = DocumentStore {path=path,valid=io_path_valid(path)}
+effect(fs) fn document_read(store:DocumentStore) -> JsonResult
+  = if !store.valid then JsonResult {ok=false,value=json_none().value,error=Error {code=22,message="invalid database path",position=0}} else
+    let raw=fs_read(store.path) in if !raw.ok then JsonResult {ok=false,value=json_none().value,error=raw.error} else json_parse(raw.value)
+effect(fs,process) fn document_transaction<C>(store:DocumentStore,context:C,update:Fn(C,Json)->JsonResult) -> JsonResult
+  = if !store.valid then JsonResult {ok=false,value=json_none().value,error=Error {code=22,message="invalid database path",position=0}} else
+    let lock=file_open(concat(store.path,".lock"),3) in
+    if !lock.ok then JsonResult {ok=false,value=json_none().value,error=lock.error} else
+    let locked=file_lock(lock.value,true) in
+    let previous=if locked.ok then document_read(store) else JsonResult {ok=false,value=json_none().value,error=locked.error} in
+    let initial=if !previous.ok && previous.error.code==2 then json_parse("null") else previous in
+    let changed=if initial.ok then update(context,initial.value) else initial in
+    let stored=if changed.ok then fs_atomic_replace(store.path,json_encode(changed.value)) else int_error(changed.error.code,changed.error.message,0) in
+    let closed=file_close(lock.value) in
+    if !stored.ok then JsonResult {ok=false,value=json_none().value,error=stored.error} else if !closed.ok then JsonResult {ok=false,value=json_none().value,error=closed.error} else changed

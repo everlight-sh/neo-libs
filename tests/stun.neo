@@ -1,0 +1,9 @@
+import "pkg:stun" as stun
+import "std:io"
+effect(fs,env) fn main() -> unit
+  = let mode=int_parse(cli_arg(1).value).value in let raw=file_read(0,1048576) in check raw.ok in
+    let output=if mode==0 then int_text(stun::stun_crc32(raw.value)) else if mode==1 then
+      if stun::stun_verify_short_term(raw.value,"VOkJxbRl1RmTxUk/WvJxBt","\xb7\xe7\xa7\x01\xbc\x34\xd6\x86\xfa\x87\xdf\xae") then "valid" else "invalid" else
+      if mode==2 then let result=stun::stun_binding_request("remote:local","password","123456789012",1845501695,"12345678",true,true) in if result.ok then result.value else "error" else
+      let address=stun::stun_xor_address(stun::stun_decode(raw.value)) in if address.ok then concat(address.host,":",int_text(address.port)) else "invalid" in
+    let printed=print_out(output) in noop()

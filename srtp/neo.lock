@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "packages": {
+    "neo-rtp@0.1.0": {
+      "dependencies": {},
+      "dependency_paths": {},
+      "name": "neo-rtp",
+      "path": "../rtp",
+      "sha256": "1b3b13181ff84c84d4625098ac59583bb4ddb88e17a00931e8732768be22e64c",
+      "version": "0.1.0"
+    },
+    "neo-srtp@0.1.0": {
+      "dependencies": {
+        "rtp": "neo-rtp@0.1.0"
+      },
+      "dependency_paths": {
+        "rtp": "../rtp"
+      },
+      "name": "neo-srtp",
+      "path": ".",
+      "sha256": null,
+      "version": "0.1.0"
+    }
+  },
+  "root": "neo-srtp@0.1.0"
+}

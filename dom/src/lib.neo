@@ -1,0 +1,1136 @@
+import "pkg:html" as html
+import "std:strings"
+import "std:vec"
+
+; DOM tree and HTML tree construction (WHATWG 13.2.6), profile 0.1.
+;
+; The tree is a node store: payloads in a Vec, links in parallel i64 arrays
+; (-1 means none), so nodes are plain indices and no recursive types are
+; needed. Node kinds use DOM nodeType numbers: 1 element, 3 text, 7 processing
+; instruction (name: target, text: data), 8 comment, 9 document, 10 doctype,
+; 11 document fragment (a template's contents).
+; Namespaces: 0 HTML, 1 SVG, 2 MathML. Node 0 is the document.
+;
+; The tree builder implements the insertion modes, the adoption agency
+; algorithm, foster parenting, foreign content (SVG and MathML) and fragment
+; parsing. It drives the html tokenizer step by step and tells it when to
+; switch to raw text and when CDATA sections are allowed. Scripts never run;
+; the scripting flag only decides how <noscript> parses.
+
+type DomData = { kind:i64,ns:i64,name:Arr u8 _,text:Arr u8 _,attributes:Arr html::HtmlAttribute _ }
+type Dom = { data:Vec<DomData>,parent:Arr i64 _,first:Arr i64 _,last:Arr i64 _,prior:Arr i64 _,later:Arr i64 _,content:Arr i64 _,quirks:bool }
+type DomPlace = { parent:i64,before:i64 }
+
+; ---- Node store ---------------------------------------------------------------
+
+fn dom_ints() -> Arr i64 _ = arr(i in 0..0) 0
+fn dom_get(links:Arr i64 n,i:i64) -> i64 = if i>=0 && i<n then links[i] else -1
+fn dom_put(move links:Arr i64 n,i:i64,v:i64) -> Arr i64 _ = if i>=0 && i<n then set(links,i,v) else links
+fn dom_blank() -> DomData = DomData { kind=0,ns=0,name="",text="",attributes=html::html_no_attributes() }
+fn dom_node(dom:Dom,i:i64) -> DomData = match vec_get(dom.data,i) { Some(d)=>d,None=>dom_blank() }
+fn dom_count(dom:Dom) -> i64 = vec_len(dom.data)
+fn dom_add(move dom:Dom,move data:DomData) -> Dom
+  = dom with { data=vec_push(dom.data,data),parent=push(dom.parent,-1),first=push(dom.first,-1),last=push(dom.last,-1),
+      prior=push(dom.prior,-1),later=push(dom.later,-1),content=push(dom.content,-1) }
+fn dom_new() -> Dom
+  = dom_add(Dom { data=vec_empty::<DomData>(),parent=dom_ints(),first=dom_ints(),last=dom_ints(),prior=dom_ints(),later=dom_ints(),
+      content=dom_ints(),quirks=false },DomData { kind=9,ns=0,name="",text="",attributes=html::html_no_attributes() })
+; A detached element. A template element also gets its contents fragment (the next node).
+fn dom_element(move dom:Dom,name:Arr u8 n,ns:i64,attributes:Arr html::HtmlAttribute m) -> Dom
+  = let id=dom_count(dom) in
+    let added=dom_add(dom,DomData { kind=1,ns=ns,name=name,text="",attributes=attributes }) in
+    if ns!=0 || !str_equal(name,"template") then added else
+    let fragment=dom_add(added,DomData { kind=11,ns=0,name="",text="",attributes=html::html_no_attributes() }) in
+    fragment with { content=dom_put(fragment.content,id,id+1) }
+fn dom_detach(move dom:Dom,child:i64) -> Dom
+  = let parent=dom_get(dom.parent,child) in if parent<0 then dom else
+    let before=dom_get(dom.prior,child) in let after=dom_get(dom.later,child) in
+    let a=if before<0 then dom with { first=dom_put(dom.first,parent,after) } else dom with { later=dom_put(dom.later,before,after) } in
+    let b=if after<0 then a with { last=dom_put(a.last,parent,before) } else a with { prior=dom_put(a.prior,after,before) } in
+    b with { parent=dom_put(b.parent,child,-1),prior=dom_put(b.prior,child,-1),later=dom_put(b.later,child,-1) }
+; Moves `child` under `parent`, before `before` (-1: as the last child).
+fn dom_insert(move dom:Dom,parent:i64,child:i64,before:i64) -> Dom
+  = let d=dom_detach(dom,child) in
+    let prev=if before<0 then dom_get(d.last,parent) else dom_get(d.prior,before) in
+    let a=d with { parent=dom_put(d.parent,child,parent),prior=dom_put(d.prior,child,prev) } in
+    let b=a with { later=dom_put(a.later,child,before) } in
+    let c=if prev<0 then b with { first=dom_put(b.first,parent,child) } else b with { later=dom_put(b.later,prev,child) } in
+    if before<0 then c with { last=dom_put(c.last,parent,child) } else c with { prior=dom_put(c.prior,before,child) }
+fn dom_update(move dom:Dom,i:i64,move data:DomData) -> Dom
+  = if i<0 || i>=dom_count(dom) then dom else dom with { data=vec_set(dom.data,i,data) }
+; Text goes into the text node just before the insertion point when there is one.
+fn dom_insert_text(move dom:Dom,parent:i64,before:i64,text:Arr u8 n) -> Dom
+  = let prev=if before<0 then dom_get(dom.last,parent) else dom_get(dom.prior,before) in
+    let p=dom_node(dom,prev) in
+    if p.kind==3 then dom_update(dom,prev,p with { text=concat(p.text,text) }) else
+    let id=dom_count(dom) in
+    dom_insert(dom_add(dom,DomData { kind=3,ns=0,name="",text=text,attributes=html::html_no_attributes() }),parent,id,before)
+fn dom_move_children(move dom:Dom,from:i64,to:i64) -> Dom
+  = loop(d=dom) while dom_get(d.first,from)>=0 next(let child=dom_get(d.first,from) in dom_insert(d,to,child,-1)) yield d
+
+; ---- Names and attributes -----------------------------------------------------
+
+fn dom_space(c:i64) -> bool = c==9 || c==10 || c==12 || c==13 || c==32
+fn dom_space_prefix(text:Arr u8 n) -> i64 = loop(i=0) while i<n && dom_space(str_byte(text,i)) next(i+1) yield i
+fn dom_all_space(text:Arr u8 n) -> bool = dom_space_prefix(text)>=n
+fn dom_word_end(list:Arr u8 m,from:i64) -> i64 = loop(i=from) while i<m && str_byte(list,i)!=32 next(i+1) yield i
+; Whether `name` is one of the space-separated words of `list`, which starts with a space.
+fn dom_listed(list:Arr u8 m,name:Arr u8 n) -> bool
+  = loop(i=1,found=false) while !found && i<m
+      next(dom_word_end(list,i)+1,dom_word_end(list,i)-i==n && bytes_match_at(list,i,name)) yield found
+; In " from To from To ", the word after `name`; `name` itself when it is not listed.
+fn dom_renamed(pairs:Arr u8 m,name:Arr u8 n) -> Arr u8 _
+  = let at=loop(i=1,found=-1) while found<0 && i<m
+      next(dom_word_end(pairs,dom_word_end(pairs,i)+1)+1,
+        let end=dom_word_end(pairs,i) in if end-i==n && bytes_match_at(pairs,i,name) then end+1 else -1) yield found in
+    if at<0 then str_slice(name,0,n) else str_slice(pairs,at,dom_word_end(pairs,at))
+fn dom_attr_index(list:Arr html::HtmlAttribute n,name:Arr u8 m) -> i64
+  = loop(i=0,found=-1) while found<0 && i<n next(i+1,check i>=0 && i<n in if str_equal(list[i].name,name) then i else -1) yield found
+fn dom_attr_has(list:Arr html::HtmlAttribute n,name:Arr u8 m) -> bool = dom_attr_index(list,name)>=0
+fn dom_attr(list:Arr html::HtmlAttribute n,name:Arr u8 m) -> Arr u8 _
+  = let at=dom_attr_index(list,name) in if at<0 || at>=n then "" else list[at].value
+fn dom_attr_value_is(list:Arr html::HtmlAttribute n,name:Arr u8 m,value:Arr u8 k) -> bool
+  = let at=dom_attr_index(list,name) in at>=0 && at<n && str_equal(list[at].value,value)
+fn dom_same_attributes(a:Arr html::HtmlAttribute n,b:Arr html::HtmlAttribute m) -> bool
+  = n==m && loop(i=0,same=true) while same && i<n next(i+1,check i>=0 && i<n in dom_attr_value_is(b,a[i].name,a[i].value)) yield same
+fn dom_drop_nul(text:Arr u8 n) -> Arr u8 _
+  = if html::html_find_byte(text,0,0)>=n then str_slice(text,0,n) else
+    loop(i=0,out="") while i<n next(i+1,if str_byte(text,i)==0 then out else concat(out,str_slice(text,i,i+1))) yield out
+fn dom_only_space(text:Arr u8 n) -> Arr u8 _
+  = loop(i=0,out="") while i<n next(i+1,if dom_space(str_byte(text,i)) then concat(out,str_slice(text,i,i+1)) else out) yield out
+
+fn dom_is(d:DomData,ns:i64,name:Arr u8 n) -> bool = d.kind==1 && d.ns==ns && str_equal(d.name,name)
+fn dom_is_in(d:DomData,ns:i64,list:Arr u8 n) -> bool = d.kind==1 && d.ns==ns && dom_listed(list,d.name)
+fn dom_special(d:DomData) -> bool
+  = d.kind==1 && (if d.ns==0 then dom_listed(" address applet area article aside base basefont bgsound blockquote body br button caption center col colgroup dd details dir div dl dt embed fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe img input keygen li link listing main marquee menu meta nav noembed noframes noscript object ol p param plaintext pre script search section select source style summary table tbody td template textarea tfoot th thead title tr track ul wbr xmp ",d.name)
+      else if d.ns==2 then dom_listed(" mi mo mn ms mtext annotation-xml ",d.name) else dom_listed(" foreignObject desc title ",d.name))
+fn dom_mathml_text_point(d:DomData) -> bool = dom_is_in(d,2," mi mo mn ms mtext ")
+fn dom_html_point(d:DomData) -> bool
+  = dom_is_in(d,1," foreignObject desc title ") || dom_is(d,2,"annotation-xml") &&
+      (let e=html::html_ascii_lower(dom_attr(d.attributes,"encoding")) in str_equal(e,"text/html") || str_equal(e,"application/xhtml+xml"))
+; Scope boundaries: 0 default, 1 list item, 2 button, 3 table.
+fn dom_scope_edge(d:DomData,scope:i64) -> bool
+  = if scope==3 then dom_is_in(d,0," html table template ")
+    else dom_is_in(d,0," applet caption html table td th marquee object select template ") || dom_is_in(d,2," mi mo mn ms mtext annotation-xml ")
+      || dom_is_in(d,1," foreignObject desc title ") || scope==1 && dom_is_in(d,0," ol ul ") || scope==2 && dom_is(d,0,"button")
+
+; Foreign element and attribute names (WHATWG 13.2.6.5 and 13.2.6.3).
+fn dom_svg_name(name:Arr u8 n) -> Arr u8 _
+  = dom_renamed(" altglyph altGlyph altglyphdef altGlyphDef altglyphitem altGlyphItem animatecolor animateColor animatemotion animateMotion animatetransform animateTransform clippath clipPath feblend feBlend fecolormatrix feColorMatrix fecomponenttransfer feComponentTransfer fecomposite feComposite feconvolvematrix feConvolveMatrix fediffuselighting feDiffuseLighting fedisplacementmap feDisplacementMap fedistantlight feDistantLight fedropshadow feDropShadow feflood feFlood fefunca feFuncA fefuncb feFuncB fefuncg feFuncG fefuncr feFuncR fegaussianblur feGaussianBlur feimage feImage femerge feMerge femergenode feMergeNode femorphology feMorphology feoffset feOffset fepointlight fePointLight fespecularlighting feSpecularLighting fespotlight feSpotLight fetile feTile feturbulence feTurbulence foreignobject foreignObject glyphref glyphRef lineargradient linearGradient radialgradient radialGradient textpath textPath ",name)
+fn dom_foreign_attribute(name:Arr u8 n,ns:i64) -> Arr u8 _
+  = if ns==2 then dom_renamed(" definitionurl definitionURL ",name)
+    else if ns!=1 then str_slice(name,0,n)
+    else dom_renamed(" attributename attributeName attributetype attributeType basefrequency baseFrequency baseprofile baseProfile calcmode calcMode clippathunits clipPathUnits diffuseconstant diffuseConstant edgemode edgeMode filterunits filterUnits glyphref glyphRef gradienttransform gradientTransform gradientunits gradientUnits kernelmatrix kernelMatrix kernelunitlength kernelUnitLength keypoints keyPoints keysplines keySplines keytimes keyTimes lengthadjust lengthAdjust limitingconeangle limitingConeAngle markerheight markerHeight markerunits markerUnits markerwidth markerWidth maskcontentunits maskContentUnits maskunits maskUnits numoctaves numOctaves pathlength pathLength patterncontentunits patternContentUnits patterntransform patternTransform patternunits patternUnits pointsatx pointsAtX pointsaty pointsAtY pointsatz pointsAtZ preservealpha preserveAlpha preserveaspectratio preserveAspectRatio primitiveunits primitiveUnits refx refX refy refY repeatcount repeatCount repeatdur repeatDur requiredextensions requiredExtensions requiredfeatures requiredFeatures specularconstant specularConstant specularexponent specularExponent spreadmethod spreadMethod startoffset startOffset stddeviation stdDeviation stitchtiles stitchTiles surfacescale surfaceScale systemlanguage systemLanguage tablevalues tableValues targetx targetX targety targetY textlength textLength viewbox viewBox viewtarget viewTarget xchannelselector xChannelSelector ychannelselector yChannelSelector zoomandpan zoomAndPan ",name)
+fn dom_foreign_attributes(list:Arr html::HtmlAttribute n,ns:i64) -> Arr html::HtmlAttribute _
+  = arr(i in 0..n) list[i] with { name=dom_foreign_attribute(list[i].name,ns) }
+
+; Quirks mode from a doctype token (WHATWG 13.2.6.4.1).
+fn dom_starts_any(text:Arr u8 n,list:Arr u8 m) -> bool
+  = loop(i=0,found=false) while !found && i<m
+      next(html::html_find_byte(list,i,124)+1,let end=html::html_find_byte(list,i,124) in end-i<=n && bytes_match_at(text,0,str_slice(list,i,end))) yield found
+fn dom_quirks(t:html::HtmlToken) -> bool
+  = let public=html::html_ascii_lower(dom_attr(t.attributes,"public")) in let system=html::html_ascii_lower(dom_attr(t.attributes,"system")) in
+    t.self_closing || !str_equal(t.name,"html") || str_equal(public,"-//w3o//dtd w3 html strict 3.0//en//") || str_equal(public,"-/w3c/dtd html 4.0 transitional/en")
+    || str_equal(public,"html") || str_equal(system,"http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd")
+    || dom_starts_any(public,"+//silmaril//dtd html pro v0r11 19970101//|-//as//dtd html 3.0 aswedit + extensions//|-//advasoft ltd//dtd html 3.0 aswedit + extensions//|-//ietf//dtd html 2.0 level 1//|-//ietf//dtd html 2.0 level 2//|-//ietf//dtd html 2.0 strict level 1//|-//ietf//dtd html 2.0 strict level 2//|-//ietf//dtd html 2.0 strict//|-//ietf//dtd html 2.0//|-//ietf//dtd html 2.1e//|-//ietf//dtd html 3.0//|-//ietf//dtd html 3.2 final//|-//ietf//dtd html 3.2//|-//ietf//dtd html 3//|-//ietf//dtd html level 0//|-//ietf//dtd html level 1//|-//ietf//dtd html level 2//|-//ietf//dtd html level 3//|-//ietf//dtd html strict level 0//|-//ietf//dtd html strict level 1//|-//ietf//dtd html strict level 2//|-//ietf//dtd html strict level 3//|-//ietf//dtd html strict//|-//ietf//dtd html//|-//metrius//dtd metrius presentational//|-//microsoft//dtd internet explorer 2.0 html strict//|-//microsoft//dtd internet explorer 2.0 html//|-//microsoft//dtd internet explorer 2.0 tables//|-//microsoft//dtd internet explorer 3.0 html strict//|-//microsoft//dtd internet explorer 3.0 html//|-//microsoft//dtd internet explorer 3.0 tables//|-//netscape comm. corp.//dtd html//|-//netscape comm. corp.//dtd strict html//|-//o'reilly and associates//dtd html 2.0//|-//o'reilly and associates//dtd html extended 1.0//|-//o'reilly and associates//dtd html extended relaxed 1.0//|-//sq//dtd html 2.0 hotmetal + extensions//|-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//|-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//|-//spyglass//dtd html 2.0 extended//|-//sun microsystems corp.//dtd hotjava html//|-//sun microsystems corp.//dtd hotjava strict html//|-//w3c//dtd html 3 1995-03-24//|-//w3c//dtd html 3.2 draft//|-//w3c//dtd html 3.2 final//|-//w3c//dtd html 3.2//|-//w3c//dtd html 3.2s draft//|-//w3c//dtd html 4.0 frameset//|-//w3c//dtd html 4.0 transitional//|-//w3c//dtd html experimental 19960712//|-//w3c//dtd html experimental 970421//|-//w3c//dtd w3 html//|-//w3o//dtd w3 html 3.0//|-//webtechs//dtd mozilla html 2.0//|-//webtechs//dtd mozilla html//")
+    || !dom_attr_has(t.attributes,"system") && dom_starts_any(public,"-//w3c//dtd html 4.01 frameset//|-//w3c//dtd html 4.01 transitional//")
+
+; ---- Tree builder state -------------------------------------------------------
+
+; Insertion modes: 0 initial, 1 before html, 2 before head, 3 in head, 4 in head
+; noscript, 5 after head, 6 in body, 7 text, 8 in table, 9 in table text, 10 in
+; caption, 11 in column group, 12 in table body, 13 in row, 14 in cell, 17 in
+; template, 18 after body, 19 in frameset, 20 after frameset, 21 after after
+; body, 22 after after frameset. (15 and 16, the select modes, left the
+; standard with customizable <select>.)
+; `open` holds the stack of open elements up to `depth`; `active` the active
+; formatting elements (-1 is a marker). `raw` asks the tokenizer to switch to
+; raw text after the current token; `context` is the fragment context element.
+type HtmlBuilder = { dom:Dom,open:Arr i64 _,depth:i64,active:Arr i64 _,mode:i64,original:i64,templates:Arr i64 _,head:i64,form:i64,
+  frameset_ok:bool,foster:bool,scripting:bool,skip_newline:bool,pending:Arr u8 _,raw:Arr u8 _,context:i64,done:bool }
+type DomAgency = { b:HtmlBuilder,status:i64 }
+type DomInner = { b:HtmlBuilder,at:i64,last:i64,bookmark:i64,count:i64,done:bool }
+type HtmlParse = { scan:html::HtmlScan,b:HtmlBuilder,seen:i64 }
+
+fn b_new(scripting:bool) -> HtmlBuilder
+  = HtmlBuilder { dom=dom_new(),open=dom_ints(),depth=0,active=dom_ints(),mode=0,original=0,templates=dom_ints(),head=-1,form=-1,
+      frameset_ok=true,foster=false,scripting=scripting,skip_newline=false,pending="",raw="",context=-1,done=false }
+fn b_node(b:HtmlBuilder,id:i64) -> DomData = dom_node(b.dom,id)
+fn b_at(b:HtmlBuilder,i:i64) -> i64 = if i>=0 && i<b.depth then dom_get(b.open,i) else -1
+fn b_current(b:HtmlBuilder) -> i64 = b_at(b,b.depth-1)
+fn b_current_is(b:HtmlBuilder,name:Arr u8 n) -> bool = dom_is(b_node(b,b_current(b)),0,name)
+fn b_current_in(b:HtmlBuilder,list:Arr u8 n) -> bool = dom_is_in(b_node(b,b_current(b)),0,list)
+fn b_context_is(b:HtmlBuilder,name:Arr u8 n) -> bool = b.context>=0 && dom_is(b_node(b,b.context),0,name)
+fn b_adjusted(b:HtmlBuilder) -> i64 = if b.context>=0 && b.depth==1 then b.context else b_current(b)
+fn b_push(move b:HtmlBuilder,id:i64) -> HtmlBuilder
+  = let depth=b.depth in
+    if depth<len(b.open) then b with { open=dom_put(b.open,depth,id),depth=depth+1 } else b with { open=push(b.open,id),depth=depth+1 }
+fn b_pop(move b:HtmlBuilder) -> HtmlBuilder = if b.depth>0 then b with { depth=b.depth-1 } else b
+fn b_stop(move b:HtmlBuilder) -> HtmlBuilder = b with { done=true }
+fn b_index(b:HtmlBuilder,id:i64) -> i64 = loop(i=b.depth-1) while i>=0 && b_at(b,i)!=id next(i-1) yield i
+fn b_remove_at(move b:HtmlBuilder,at:i64) -> HtmlBuilder
+  = let depth=b.depth in if at<0 || at>=depth then b else
+    let open=arr(i in 0..depth-1) if i<at then b_at(b,i) else b_at(b,i+1) in b with { open=open,depth=depth-1 }
+fn b_insert_at(move b:HtmlBuilder,at:i64,id:i64) -> HtmlBuilder
+  = let depth=b.depth in if at<0 || at>depth then b else
+    let open=arr(i in 0..depth+1) if i<at then b_at(b,i) else if i==at then id else b_at(b,i-1) in b with { open=open,depth=depth+1 }
+fn b_last_index(b:HtmlBuilder,name:Arr u8 n) -> i64 = loop(i=b.depth-1) while i>=0 && !dom_is(b_node(b,b_at(b,i)),0,name) next(i-1) yield i
+fn b_has_template(b:HtmlBuilder) -> bool = b_last_index(b,"template")>=0
+; Parsing template contents: a template on the stack, or a template fragment context.
+fn b_in_template(b:HtmlBuilder) -> bool = b_has_template(b) || b.context>=0 && dom_is(b_node(b,b.context),0,"template")
+; Whether an HTML element named in `list` is in the given scope.
+fn b_in_scope(b:HtmlBuilder,list:Arr u8 m,scope:i64) -> bool
+  = loop(i=b.depth-1,found=0) while found==0 && i>=0
+      next(i-1,let d=b_node(b,b_at(b,i)) in if dom_is_in(d,0,list) then 1 else if dom_scope_edge(d,scope) then 2 else 0) yield found==1
+fn b_node_in_scope(b:HtmlBuilder,id:i64,scope:i64) -> bool
+  = loop(i=b.depth-1,found=0) while found==0 && i>=0
+      next(i-1,let node=b_at(b,i) in if node==id then 1 else if dom_scope_edge(b_node(b,node),scope) then 2 else 0) yield found==1
+fn b_pop_until(move b:HtmlBuilder,list:Arr u8 m) -> HtmlBuilder
+  = let at=loop(i=b.depth-1) while i>=0 && !dom_is_in(b_node(b,b_at(b,i)),0,list) next(i-1) yield i in
+    if at<0 then b else b with { depth=at }
+fn b_clear_to(move b:HtmlBuilder,list:Arr u8 m) -> HtmlBuilder
+  = let at=loop(i=b.depth-1) while i>=0 && !dom_is_in(b_node(b,b_at(b,i)),0,list) next(i-1) yield i in b with { depth=at+1 }
+fn b_implied(move b:HtmlBuilder,except:Arr u8 n) -> HtmlBuilder
+  = let at=loop(i=b.depth-1) while i>=0 && (let d=b_node(b,b_at(b,i)) in dom_is_in(d,0," dd dt li optgroup option p rb rp rt rtc ") && !str_equal(d.name,except))
+      next(i-1) yield i in b with { depth=at+1 }
+fn b_implied_all(move b:HtmlBuilder) -> HtmlBuilder
+  = let at=loop(i=b.depth-1) while i>=0 && dom_is_in(b_node(b,b_at(b,i)),0," caption colgroup dd dt li optgroup option p rb rp rt rtc tbody td tfoot th thead tr ")
+      next(i-1) yield i in b with { depth=at+1 }
+fn b_close_p(move b:HtmlBuilder) -> HtmlBuilder = b_pop_until(b_implied(b,"p")," p ")
+fn b_close_p_if(move b:HtmlBuilder) -> HtmlBuilder = if b_in_scope(b," p ",2) then b_close_p(b) else b
+fn b_templates_pop(move b:HtmlBuilder) -> HtmlBuilder
+  = let n=len(b.templates) in if n==0 then b else b with { templates=arr(i in 0..n-1) dom_get(b.templates,i) }
+
+; ---- Insertion -----------------------------------------------------------------
+
+cold fn b_foster(b:HtmlBuilder) -> DomPlace
+  = let template=b_last_index(b,"template") in let table=b_last_index(b,"table") in
+    if template>=0 && (table<0 || template>table) then DomPlace { parent=b_at(b,template),before=-1 }
+    else if table<0 then DomPlace { parent=b_at(b,0),before=-1 }
+    else let node=b_at(b,table) in let parent=dom_get(b.dom.parent,node) in
+      if parent>=0 then DomPlace { parent=parent,before=node } else DomPlace { parent=b_at(b,table-1),before=-1 }
+; The appropriate place for inserting a node (WHATWG 13.2.6.1).
+fn b_place(b:HtmlBuilder,target:i64) -> DomPlace
+  = let node=if target>=0 then target else b_current(b) in
+    let place=if b.foster && dom_is_in(b_node(b,node),0," table tbody tfoot thead tr ") then b_foster(b) else DomPlace { parent=node,before=-1 } in
+    if dom_is(b_node(b,place.parent),0,"template") then DomPlace { parent=dom_get(b.dom.content,place.parent),before=-1 } else place
+fn b_insert(move b:HtmlBuilder,name:Arr u8 n,ns:i64,attributes:Arr html::HtmlAttribute m) -> HtmlBuilder
+  = let place=b_place(b,-1) in let id=dom_count(b.dom) in
+    b_push(b with { dom=dom_insert(dom_element(b.dom,name,ns,attributes),place.parent,id,place.before) },id)
+fn b_insert_token(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_insert(b,t.name,0,t.attributes)
+fn b_insert_void(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_pop(b_insert_token(b,t))
+fn b_insert_plain(move b:HtmlBuilder,name:Arr u8 n) -> HtmlBuilder = b_insert(b,name,0,html::html_no_attributes())
+fn b_text(move b:HtmlBuilder,text:Arr u8 n) -> HtmlBuilder
+  = if n==0 then b else let place=b_place(b,-1) in
+    if (let p=b_node(b,place.parent) in p.kind==9) then b else b with { dom=dom_insert_text(b.dom,place.parent,place.before,text) }
+; Comments and processing instructions, at a given place.
+fn b_comment_at(move b:HtmlBuilder,parent:i64,before:i64,t:html::HtmlToken) -> HtmlBuilder
+  = let id=dom_count(b.dom) in let kind=if t.kind==7 then 7 else 8 in
+    b with { dom=dom_insert(dom_add(b.dom,DomData { kind=kind,ns=0,name=if kind==7 then t.name else "",text=t.text,attributes=html::html_no_attributes() }),parent,id,before) }
+fn b_comment(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = let place=b_place(b,-1) in b_comment_at(b,place.parent,place.before,t)
+fn t_comment(t:html::HtmlToken) -> bool = t.kind==4 || t.kind==7
+; Generic raw text and RCDATA element parsing.
+fn b_generic(move b:HtmlBuilder,t:html::HtmlToken,raw:Arr u8 n) -> HtmlBuilder
+  = let x=b_insert_token(b,t) in let mode=x.mode in x with { raw=raw,original=mode,mode=7 }
+cold fn b_merge_attributes(move b:HtmlBuilder,id:i64,list:Arr html::HtmlAttribute n) -> HtmlBuilder
+  = let d=b_node(b,id) in
+    let merged=loop(i=0,out=d.attributes) while i<n next(i+1,check i>=0 && i<n in if dom_attr_has(out,list[i].name) then out else push(out,list[i])) yield out in
+    b with { dom=dom_update(b.dom,id,d with { attributes=merged }) }
+
+; ---- Active formatting elements ------------------------------------------------
+
+fn b_marker(b:HtmlBuilder) -> i64 = loop(i=len(b.active)-1) while i>=0 && dom_get(b.active,i)!=-1 next(i-1) yield i
+fn b_active_index(b:HtmlBuilder,id:i64) -> i64 = if id<0 then -1 else loop(i=len(b.active)-1) while i>=0 && dom_get(b.active,i)!=id next(i-1) yield i
+fn b_active_remove_at(move b:HtmlBuilder,at:i64) -> HtmlBuilder
+  = let n=len(b.active) in if at<0 || at>=n then b else b with { active=arr(i in 0..n-1) if i<at then dom_get(b.active,i) else dom_get(b.active,i+1) }
+fn b_active_insert_at(move b:HtmlBuilder,at:i64,id:i64) -> HtmlBuilder
+  = let n=len(b.active) in if at<0 || at>n then b else
+    b with { active=arr(i in 0..n+1) if i<at then dom_get(b.active,i) else if i==at then id else dom_get(b.active,i-1) }
+fn b_active_marker(move b:HtmlBuilder) -> HtmlBuilder = b with { active=push(b.active,-1) }
+fn b_active_clear(move b:HtmlBuilder) -> HtmlBuilder
+  = let at=b_marker(b) in b with { active=if at<=0 then dom_ints() else arr(i in 0..at) dom_get(b.active,i) }
+fn b_active_find(b:HtmlBuilder,name:Arr u8 n) -> i64
+  = let marker=b_marker(b) in
+    loop(i=len(b.active)-1,found=-1) while found<0 && i>marker next(i-1,let id=dom_get(b.active,i) in if dom_is(b_node(b,id),0,name) then id else -1) yield found
+fn dom_same_element(a:DomData,b:DomData) -> bool
+  = a.kind==1 && b.kind==1 && a.ns==b.ns && str_equal(a.name,b.name) && dom_same_attributes(a.attributes,b.attributes)
+; Pushes a formatting element, keeping at most three equal ones after the last marker.
+fn b_active_push(move b:HtmlBuilder,id:i64) -> HtmlBuilder
+  = let d=b_node(b,id) in let marker=b_marker(b) in let n=len(b.active) in
+    let count=loop(i=n-1,c=0) while i>marker next(i-1,if dom_same_element(b_node(b,dom_get(b.active,i)),d) then c+1 else c) yield c in
+    let earliest=if count<3 then -1 else loop(i=marker+1,found=-1) while found<0 && i<n next(i+1,if dom_same_element(b_node(b,dom_get(b.active,i)),d) then i else -1) yield found in
+    let trimmed=b_active_remove_at(b,earliest) in trimmed with { active=push(trimmed.active,id) }
+fn b_recreate(move b:HtmlBuilder,at:i64) -> HtmlBuilder
+  = let d=b_node(b,dom_get(b.active,at)) in let made=b_insert(b,d.name,d.ns,d.attributes) in
+    let id=b_current(made) in made with { active=dom_put(made.active,at,id) }
+fn b_reconstruct(move b:HtmlBuilder) -> HtmlBuilder
+  = let n=len(b.active) in if n==0 then b else
+    let last=dom_get(b.active,n-1) in if last==-1 || b_index(b,last)>=0 then b else
+    let start=loop(i=n-1) while i>0 && (let e=dom_get(b.active,i-1) in e!=-1 && b_index(b,e)<0) next(i-1) yield i in
+    loop(i=start,x=b) while i<n next(i+1,b_recreate(x,i)) yield x
+fn b_formatting(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let x=b_insert_token(b,t) in let id=b_current(x) in b_active_push(x,id)
+fn b_drop_formatting(move b:HtmlBuilder,id:i64) -> HtmlBuilder
+  = let at=b_active_index(b,id) in let x=b_active_remove_at(b,at) in let s=b_index(x,id) in b_remove_at(x,s)
+
+; ---- Adoption agency algorithm (WHATWG 13.2.6.4.7) -----------------------------
+
+; status: 0 run another round, 1 done, 2 treat as any other end tag.
+cold fn b_adoption(move b:HtmlBuilder,name:Arr u8 n) -> DomAgency
+  = let current=b_current(b) in
+    if dom_is(b_node(b,current),0,name) && b_active_index(b,current)<0 then DomAgency { b=b_pop(b),status=1 } else
+    let done=loop(round=0,state=DomAgency { b=b,status=0 }) while state.status==0 && round<8 next(round+1,b_adoption_round(state.b,name)) yield state in
+    if done.status==2 then done else done with { status=1 }
+fn b_inner_step(move s:DomInner,fe:i64,furthest:i64) -> DomInner
+  = let count=s.count+1 in let at=s.at-1 in let last=s.last in let bookmark=s.bookmark in let b=s.b in
+    let node=b_at(b,at) in
+    if node==fe || node<0 then DomInner { b=b,at=at,last=last,bookmark=bookmark,count=count,done=true } else
+    let listed=b_active_index(b,node) in let dropped=count>3 && listed>=0 in
+    let b1=if dropped then b_active_remove_at(b,listed) else b in
+    if dropped || listed<0 then DomInner { b=b_remove_at(b1,at),at=at,last=last,bookmark=bookmark,count=count,done=false } else
+    let d=b_node(b1,node) in let made=dom_count(b1.dom) in
+    let b2=b1 with { dom=dom_element(b1.dom,d.name,d.ns,d.attributes) } in
+    let b3=b2 with { active=dom_put(b2.active,listed,made),open=dom_put(b2.open,at,made) } in
+    let b4=b3 with { dom=dom_insert(b3.dom,made,last,-1) } in
+    DomInner { b=b4,at=at,last=made,bookmark=if last==furthest then made else bookmark,count=count,done=false }
+cold fn b_adoption_round(move b:HtmlBuilder,name:Arr u8 n) -> DomAgency
+  = let fe=b_active_find(b,name) in
+    if fe<0 then DomAgency { b=b,status=2 } else
+    let fe_at=b_index(b,fe) in let fe_listed=b_active_index(b,fe) in
+    if fe_at<0 then DomAgency { b=b_active_remove_at(b,fe_listed),status=1 } else
+    if !b_node_in_scope(b,fe,0) then DomAgency { b=b,status=1 } else
+    let depth=b.depth in
+    let furthest_at=loop(i=fe_at+1) while i<depth && !dom_special(b_node(b,b_at(b,i))) next(i+1) yield i in
+    if furthest_at>=depth then DomAgency { b=b_active_remove_at(b with { depth=fe_at },fe_listed),status=1 } else
+    let furthest=b_at(b,furthest_at) in let common=b_at(b,fe_at-1) in
+    let inner=loop(s=DomInner { b=b,at=furthest_at,last=furthest,bookmark=-1,count=0,done=false }) while !s.done next(b_inner_step(s,fe,furthest)) yield s in
+    let last=inner.last in let bookmark=inner.bookmark in let x=inner.b in
+    let place=b_place(x,common) in
+    let x1=x with { dom=dom_insert(x.dom,place.parent,last,place.before) } in
+    let fd=b_node(x1,fe) in let made=dom_count(x1.dom) in
+    let x2=x1 with { dom=dom_element(x1.dom,fd.name,fd.ns,fd.attributes) } in
+    let x3=x2 with { dom=dom_move_children(x2.dom,furthest,made) } in
+    let x4=x3 with { dom=dom_insert(x3.dom,furthest,made,-1) } in
+    let x5=if bookmark<0 then (let at=b_active_index(x4,fe) in x4 with { active=dom_put(x4.active,at,made) })
+      else let after=b_active_index(x4,bookmark) in let y=b_active_insert_at(x4,after+1,made) in let at=b_active_index(y,fe) in b_active_remove_at(y,at) in
+    let fe_now=b_index(x5,fe) in let x6=b_remove_at(x5,fe_now) in let below=b_index(x6,furthest) in
+    DomAgency { b=b_insert_at(x6,below+1,made),status=0 }
+
+; ---- Resetting the insertion mode (WHATWG 13.2.4.1) ----------------------------
+
+fn b_mode_for(b:HtmlBuilder,at:i64) -> i64
+  = let last=at==0 in let node=if last && b.context>=0 then b.context else b_at(b,at) in let d=b_node(b,node) in
+    if d.ns!=0 then (if last then 6 else -1)
+    else if dom_listed(" td th ",d.name) && !last then 14
+    else if str_equal(d.name,"tr") then 13
+    else if dom_listed(" tbody thead tfoot ",d.name) then 12
+    else if str_equal(d.name,"caption") then 10
+    else if str_equal(d.name,"colgroup") then 11
+    else if str_equal(d.name,"table") then 8
+    else if str_equal(d.name,"template") then dom_get(b.templates,len(b.templates)-1)
+    else if str_equal(d.name,"head") && !last then 3
+    else if str_equal(d.name,"body") then 6
+    else if str_equal(d.name,"frameset") then 19
+    else if str_equal(d.name,"html") then (if b.head<0 then 2 else 5)
+    else if last then 6 else -1
+fn b_reset(move b:HtmlBuilder) -> HtmlBuilder
+  = let mode=loop(i=b.depth-1,found=-1) while found<0 && i>=0 next(i-1,b_mode_for(b,i)) yield found in
+    b with { mode=if mode<0 then 6 else mode }
+
+; ---- Insertion modes (WHATWG 13.2.6.4) -----------------------------------------
+
+fn t_start(t:html::HtmlToken,list:Arr u8 n) -> bool = t.kind==2 && dom_listed(list,t.name)
+fn t_end(t:html::HtmlToken,list:Arr u8 n) -> bool = t.kind==3 && dom_listed(list,t.name)
+fn t_is_start(t:html::HtmlToken,name:Arr u8 n) -> bool = t.kind==2 && str_equal(t.name,name)
+fn t_is_end(t:html::HtmlToken,name:Arr u8 n) -> bool = t.kind==3 && str_equal(t.name,name)
+fn t_rest(t:html::HtmlToken,cut:i64) -> html::HtmlToken = t with { text=str_slice(t.text,cut,len(t.text)) }
+fn t_word(name:Arr u8 n) -> Arr u8 _ = concat(" ",name," ")
+
+cold fn m_initial(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then (let cut=dom_space_prefix(t.text) in if cut>=len(t.text) then b else m_initial_else(b,t_rest(t,cut)))
+    else if t_comment(t) then b_comment_at(b,0,-1,t)
+    else if t.kind==5 then
+      let id=dom_count(b.dom) in let quirks=dom_quirks(t) in
+      let doctype=dom_add(b.dom,DomData { kind=10,ns=0,name=t.name,text="",attributes=t.attributes }) in
+      b with { dom=dom_insert(doctype,0,id,-1) with { quirks=quirks },mode=1 }
+    else m_initial_else(b,t)
+fn m_initial_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_dispatch(b with { dom=b.dom with { quirks=true },mode=1 },t)
+fn b_root(move b:HtmlBuilder,list:Arr html::HtmlAttribute n) -> HtmlBuilder
+  = let id=dom_count(b.dom) in b_push(b with { dom=dom_insert(dom_element(b.dom,"html",0,list),0,id,-1) },id)
+cold fn m_before_html(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==5 then b
+    else if t_comment(t) then b_comment_at(b,0,-1,t)
+    else if t.kind==1 then (let cut=dom_space_prefix(t.text) in if cut>=len(t.text) then b else m_before_html_else(b,t_rest(t,cut)))
+    else if t_is_start(t,"html") then b_root(b,t.attributes) with { mode=2 }
+    else if t.kind==3 && !dom_listed(" head body html br ",t.name) then b
+    else m_before_html_else(b,t)
+fn m_before_html_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_dispatch(b_root(b,html::html_no_attributes()) with { mode=2 },t)
+cold fn m_before_head(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then (let cut=dom_space_prefix(t.text) in if cut>=len(t.text) then b else m_before_head_else(b,t_rest(t,cut)))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_start(t,"head") then (let x=b_insert_token(b,t) in let id=b_current(x) in x with { head=id,mode=3 })
+    else if t.kind==3 && !dom_listed(" head body html br ",t.name) then b
+    else m_before_head_else(b,t)
+fn m_before_head_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let x=b_insert_plain(b,"head") in let id=b_current(x) in b_dispatch(x with { head=id,mode=3 },t)
+fn m_in_head(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then
+      let cut=dom_space_prefix(t.text) in let x=b_text(b,str_slice(t.text,0,cut)) in if cut>=len(t.text) then x else m_in_head_else(x,t_rest(t,cut))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_start(t," base basefont bgsound link meta ") then b_insert_void(b,t)
+    else if t_is_start(t,"title") then b_generic(b,t,"title")
+    else if t_start(t," noframes style ") || b.scripting && t_is_start(t,"noscript") then b_generic(b,t,t.name)
+    else if t_is_start(t,"noscript") then b_insert_token(b,t) with { mode=4 }
+    else if t_is_start(t,"script") then b_generic(b,t,"script")
+    else if t_is_end(t,"head") then b_pop(b) with { mode=5 }
+    else if t_is_start(t,"template") then
+      let x=b_active_marker(b_insert_token(b,t)) in x with { frameset_ok=false,mode=17,templates=push(x.templates,17) }
+    else if t_is_end(t,"template") then b_end_template(b)
+    else if t_is_start(t,"head") || t.kind==3 && !dom_listed(" body html br ",t.name) then b
+    else m_in_head_else(b,t)
+fn m_in_head_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_dispatch(b_pop(b) with { mode=5 },t)
+cold fn b_end_template(move b:HtmlBuilder) -> HtmlBuilder
+  = if !b_has_template(b) then b else b_reset(b_templates_pop(b_active_clear(b_pop_until(b_implied_all(b)," template "))))
+cold fn m_in_head_noscript(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_end(t,"noscript") then b_pop(b) with { mode=3 }
+    else if t.kind==1 then
+      let cut=dom_space_prefix(t.text) in let x=if cut>0 then m_in_head(b,t with { text=str_slice(t.text,0,cut) }) else b in
+      if cut>=len(t.text) then x else m_noscript_else(x,t_rest(t,cut))
+    else if t_comment(t) || t_start(t," basefont bgsound link meta noframes style ") then m_in_head(b,t)
+    else if t_is_end(t,"br") then m_noscript_else(b,t)
+    else if t_start(t," head noscript ") || t.kind==3 then b
+    else m_noscript_else(b,t)
+fn m_noscript_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_dispatch(b_pop(b) with { mode=3 },t)
+fn m_after_head(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then
+      let cut=dom_space_prefix(t.text) in let x=b_text(b,str_slice(t.text,0,cut)) in if cut>=len(t.text) then x else m_after_head_else(x,t_rest(t,cut))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_start(t,"body") then b_insert_token(b,t) with { frameset_ok=false,mode=6 }
+    else if t_is_start(t,"frameset") then b_insert_token(b,t) with { mode=19 }
+    else if t_start(t," base basefont bgsound link meta noframes script style template title ") then
+      let head=b.head in let x=m_in_head(b_push(b,head),t) in let at=b_index(x,head) in b_remove_at(x,at)
+    else if t_is_end(t,"template") then m_in_head(b,t)
+    else if t_is_start(t,"head") || t.kind==3 && !dom_listed(" body html br ",t.name) then b
+    else m_after_head_else(b,t)
+fn m_after_head_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = b_dispatch(b_insert_plain(b,"body") with { frameset_ok=true,mode=6 },t)
+
+cold fn b_close_list(move b:HtmlBuilder,list:Arr u8 n) -> HtmlBuilder
+  = let at=loop(i=b.depth-1,found=-1) while found==-1 && i>=0
+      next(i-1,let d=b_node(b,b_at(b,i)) in if dom_is_in(d,0,list) then i else if dom_special(d) && !dom_is_in(d,0," address div p ") then -2 else -1) yield found in
+    if at<0 then b else let name=(b_node(b,b_at(b,at))).name in b_pop_until(b_implied(b,name),t_word(name))
+fn b_body_text(move b:HtmlBuilder,text:Arr u8 n) -> HtmlBuilder
+  = let clean=dom_drop_nul(text) in if len(clean)==0 then b else
+    let x=b_text(b_reconstruct(b),clean) in if dom_all_space(clean) then x else x with { frameset_ok=false }
+fn b_foreign_start(move b:HtmlBuilder,t:html::HtmlToken,ns:i64) -> HtmlBuilder
+  = let x=b_insert(b,t.name,ns,dom_foreign_attributes(t.attributes,ns)) in if t.self_closing then b_pop(x) else x
+fn b_body_start(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let name=t.name in
+    if str_equal(name,"html") then (if b_has_template(b) then b else let root=b_at(b,0) in b_merge_attributes(b,root,t.attributes))
+    else if dom_listed(" base basefont bgsound link meta noframes script style template title ",name) then m_in_head(b,t)
+    else if str_equal(name,"body") then
+      (let second=b_at(b,1) in if b.depth<2 || !dom_is(b_node(b,second),0,"body") || b_has_template(b) then b else b_merge_attributes(b with { frameset_ok=false },second,t.attributes))
+    else if str_equal(name,"frameset") then
+      (let second=b_at(b,1) in if b.depth<2 || !dom_is(b_node(b,second),0,"body") || !b.frameset_ok then b else
+        b_insert_token(b with { dom=dom_detach(b.dom,second),depth=1 },t) with { mode=19 })
+    else if dom_listed(" address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer header hgroup main menu nav ol p search section summary ul ",name) then b_insert_token(b_close_p_if(b),t)
+    else if dom_listed(" h1 h2 h3 h4 h5 h6 ",name) then
+      (let x=b_close_p_if(b) in b_insert_token(if b_current_in(x," h1 h2 h3 h4 h5 h6 ") then b_pop(x) else x,t))
+    else if dom_listed(" pre listing ",name) then b_insert_token(b_close_p_if(b),t) with { skip_newline=true,frameset_ok=false }
+    else if str_equal(name,"form") then
+      (if b.form>=0 && !b_in_template(b) then b else
+        let x=b_insert_token(b_close_p_if(b),t) in if b_in_template(x) then x else let id=b_current(x) in x with { form=id })
+    else if str_equal(name,"li") then b_insert_token(b_close_p_if(b_close_list(b with { frameset_ok=false }," li ")),t)
+    else if dom_listed(" dd dt ",name) then b_insert_token(b_close_p_if(b_close_list(b with { frameset_ok=false }," dd dt ")),t)
+    else if str_equal(name,"plaintext") then b_insert_token(b_close_p_if(b),t) with { raw="plaintext" }
+    else if str_equal(name,"button") then
+      (let x=if b_in_scope(b," button ",0) then b_pop_until(b_implied(b,"")," button ") else b in b_insert_token(b_reconstruct(x),t) with { frameset_ok=false })
+    else if str_equal(name,"a") then
+      (let found=b_active_find(b,"a") in
+        let x=if found<0 then b else (let r=b_adoption(b,"a") in let status=r.status in
+          let y=if status==2 then b_end_other(r.b,html::html_token(3,"a","")) else r.b in b_drop_formatting(y,found)) in b_formatting(b_reconstruct(x),t))
+    else if dom_listed(" b big code em font i s small strike strong tt u ",name) then b_formatting(b_reconstruct(b),t)
+    else if str_equal(name,"nobr") then
+      (let x=b_reconstruct(b) in
+        let y=if b_in_scope(x," nobr ",0) then (let r=b_adoption(x,"nobr") in let status=r.status in
+          b_reconstruct(if status==2 then b_end_other(r.b,html::html_token(3,"nobr","")) else r.b)) else x in b_formatting(y,t))
+    else if dom_listed(" applet marquee object ",name) then b_active_marker(b_insert_token(b_reconstruct(b),t)) with { frameset_ok=false }
+    else if str_equal(name,"table") then
+      (let x=if !b.dom.quirks && b_in_scope(b," p ",2) then b_close_p(b) else b in b_insert_token(x,t) with { frameset_ok=false,mode=8 })
+    else if dom_listed(" area br embed img keygen wbr ",name) then b_insert_void(b_reconstruct(b),t) with { frameset_ok=false }
+    else if str_equal(name,"input") then
+      (if b_context_is(b,"select") then b else
+        let hidden=str_equal(html::html_ascii_lower(dom_attr(t.attributes,"type")),"hidden") in
+        let open=if b_in_scope(b," select ",0) then b_pop_until(b," select ") else b in
+        let x=b_insert_void(b_reconstruct(open),t) in if hidden then x else x with { frameset_ok=false })
+    else if dom_listed(" param source track ",name) then b_insert_void(b,t)
+    else if str_equal(name,"hr") then
+      (let x=b_close_p_if(b) in b_insert_void(if b_in_scope(x," select ",0) then b_implied(x,"") else x,t) with { frameset_ok=false })
+    else if str_equal(name,"image") then b_body_start(b,t with { name="img" })
+    else if str_equal(name,"textarea") then
+      (let x=b_insert_token(b,t) in let mode=x.mode in x with { skip_newline=true,raw="textarea",original=mode,frameset_ok=false,mode=7 })
+    else if str_equal(name,"xmp") then b_generic(b_reconstruct(b_close_p_if(b)) with { frameset_ok=false },t,"xmp")
+    else if str_equal(name,"iframe") then b_generic(b with { frameset_ok=false },t,"iframe")
+    else if str_equal(name,"noembed") || b.scripting && str_equal(name,"noscript") then b_generic(b,t,name)
+    else if str_equal(name,"select") then
+      (if b_context_is(b,"select") then b else if b_in_scope(b," select ",0) then b_pop_until(b," select ")
+        else b_insert_token(b_reconstruct(b),t) with { frameset_ok=false })
+    else if str_equal(name,"option") then
+      b_insert_token(b_reconstruct(if b_in_scope(b," select ",0) then b_implied(b,"optgroup") else if b_current_is(b,"option") then b_pop(b) else b),t)
+    else if str_equal(name,"optgroup") then
+      b_insert_token(b_reconstruct(if b_in_scope(b," select ",0) then b_implied(b,"") else if b_current_is(b,"option") then b_pop(b) else b),t)
+    else if dom_listed(" rb rtc ",name) then b_insert_token(if b_in_scope(b," ruby ",0) then b_implied(b,"") else b,t)
+    else if dom_listed(" rp rt ",name) then b_insert_token(if b_in_scope(b," ruby ",0) then b_implied(b,"rtc") else b,t)
+    else if str_equal(name,"math") then b_foreign_start(b_reconstruct(b),t,2)
+    else if str_equal(name,"svg") then b_foreign_start(b_reconstruct(b),t,1)
+    else if dom_listed(" caption col colgroup frame head tbody td tfoot th thead tr ",name) then b
+    else b_insert_token(b_reconstruct(b),t)
+cold fn b_end_form(move b:HtmlBuilder) -> HtmlBuilder
+  = if !b_in_template(b) then
+      let node=b.form in let x=b with { form=-1 } in
+      if node<0 || !b_node_in_scope(x,node,0) then x else let y=b_implied(x,"") in let at=b_index(y,node) in b_remove_at(y,at)
+    else if !b_in_scope(b," form ",0) then b else b_pop_until(b_implied(b,"")," form ")
+; Any other end tag in body.
+fn b_end_other(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let at=loop(i=b.depth-1,found=-1) while found==-1 && i>=0
+      next(i-1,let d=b_node(b,b_at(b,i)) in if dom_is(d,0,t.name) then i else if dom_special(d) then -2 else -1) yield found in
+    if at<0 then b else b_implied(b,t.name) with { depth=at }
+fn b_body_end(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let name=t.name in
+    if str_equal(name,"template") then m_in_head(b,t)
+    else if str_equal(name,"body") then (if b_in_scope(b," body ",0) then b with { mode=18 } else b)
+    else if str_equal(name,"html") then (if b_in_scope(b," body ",0) then b_dispatch(b with { mode=18 },t) else b)
+    else if dom_listed(" address article aside blockquote button center details dialog dir div dl fieldset figcaption figure footer header hgroup listing main menu nav ol pre search section select summary ul ",name) then
+      (if b_in_scope(b,t_word(name),0) then b_pop_until(b_implied(b,""),t_word(name)) else b)
+    else if str_equal(name,"form") then b_end_form(b)
+    else if str_equal(name,"p") then b_close_p(if b_in_scope(b," p ",2) then b else b_insert_plain(b,"p"))
+    else if str_equal(name,"li") then (if b_in_scope(b," li ",1) then b_pop_until(b_implied(b,"li")," li ") else b)
+    else if dom_listed(" dd dt ",name) then (if b_in_scope(b,t_word(name),0) then b_pop_until(b_implied(b,name),t_word(name)) else b)
+    else if dom_listed(" h1 h2 h3 h4 h5 h6 ",name) then
+      (if b_in_scope(b," h1 h2 h3 h4 h5 h6 ",0) then b_pop_until(b_implied(b,"")," h1 h2 h3 h4 h5 h6 ") else b)
+    else if dom_listed(" a b big code em font i nobr s small strike strong tt u ",name) then
+      (let r=b_adoption(b,name) in if r.status==2 then b_end_other(r.b,t) else r.b)
+    else if dom_listed(" applet marquee object ",name) then
+      (if b_in_scope(b,t_word(name),0) then b_active_clear(b_pop_until(b_implied(b,""),t_word(name))) else b)
+    else if str_equal(name,"br") then b_body_start(b,html::html_token(2,"br",""))
+    else b_end_other(b,t)
+fn m_body(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then b_body_text(b,t.text)
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t.kind==6 then (if len(b.templates)>0 then m_template(b,t) else b_stop(b))
+    else if t.kind==2 then b_body_start(b,t)
+    else b_body_end(b,t)
+fn m_text(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let original=b.original in
+    if t.kind==1 then b_text(b,t.text)
+    else if t.kind==6 then b_dispatch(b_pop(b) with { mode=original },t)
+    else if t.kind==3 then b_pop(b) with { mode=original }
+    else b
+fn b_table_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder = m_body(b with { foster=true },t) with { foster=false }
+fn m_table(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then
+      (if b_current_in(b," table tbody template tfoot thead tr ") then let mode=b.mode in m_table_text(b with { pending="",original=mode,mode=9 },t) else b_table_else(b,t))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"caption") then b_insert_token(b_active_marker(b_clear_to(b," table template html ")),t) with { mode=10 }
+    else if t_is_start(t,"colgroup") then b_insert_token(b_clear_to(b," table template html "),t) with { mode=11 }
+    else if t_is_start(t,"col") then b_dispatch(b_insert_plain(b_clear_to(b," table template html "),"colgroup") with { mode=11 },t)
+    else if t_start(t," tbody tfoot thead ") then b_insert_token(b_clear_to(b," table template html "),t) with { mode=12 }
+    else if t_start(t," td th tr ") then b_dispatch(b_insert_plain(b_clear_to(b," table template html "),"tbody") with { mode=12 },t)
+    else if t_is_start(t,"table") then (if b_in_scope(b," table ",3) then b_dispatch(b_reset(b_pop_until(b," table ")),t) else b)
+    else if t_is_end(t,"table") then (if b_in_scope(b," table ",3) then b_reset(b_pop_until(b," table ")) else b)
+    else if t_end(t," body caption col colgroup html tbody td tfoot th thead tr ") then b
+    else if t_start(t," style script template ") || t_is_end(t,"template") then m_in_head(b,t)
+    else if t_is_start(t,"input") && str_equal(html::html_ascii_lower(dom_attr(t.attributes,"type")),"hidden") then b_insert_void(b,t)
+    else if t_is_start(t,"form") then
+      (if b.form>=0 && !b_in_template(b) then b else let x=b_insert_token(b,t) in let id=b_current(x) in b_pop(if b_in_template(x) then x else x with { form=id }))
+    else if t.kind==6 then m_body(b,t)
+    else b_table_else(b,t)
+fn m_table_text(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then b with { pending=concat(b.pending,dom_drop_nul(t.text)) } else
+    let pending=b.pending in let original=b.original in
+    let x=if dom_all_space(pending) then b_text(b,pending) else b_table_else(b,html::html_token(1,"",pending)) in
+    b_dispatch(x with { pending="",mode=original },t)
+fn b_close_caption(move b:HtmlBuilder) -> HtmlBuilder = b_active_clear(b_pop_until(b_implied(b,"")," caption ")) with { mode=8 }
+cold fn m_caption(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t_is_end(t,"caption") then (if b_in_scope(b," caption ",3) then b_close_caption(b) else b)
+    else if t_start(t," caption col colgroup tbody td tfoot th thead tr ") || t_is_end(t,"table") then
+      (if b_in_scope(b," caption ",3) then b_dispatch(b_close_caption(b),t) else b)
+    else if t_end(t," body col colgroup html tbody td tfoot th thead tr ") then b
+    else m_body(b,t)
+cold fn m_colgroup(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then
+      let cut=dom_space_prefix(t.text) in let x=b_text(b,str_slice(t.text,0,cut)) in if cut>=len(t.text) then x else m_colgroup_else(x,t_rest(t,cut))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_start(t,"col") then b_insert_void(b,t)
+    else if t_is_end(t,"colgroup") then (if b_current_is(b,"colgroup") then b_pop(b) with { mode=8 } else b)
+    else if t_is_end(t,"col") then b
+    else if t_is_start(t,"template") || t_is_end(t,"template") then m_in_head(b,t)
+    else if t.kind==6 then m_body(b,t)
+    else m_colgroup_else(b,t)
+fn m_colgroup_else(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if b_current_is(b,"colgroup") then b_dispatch(b_pop(b) with { mode=8 },t) else b
+fn m_tbody(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t_is_start(t,"tr") then b_insert_token(b_clear_to(b," tbody tfoot thead template html "),t) with { mode=13 }
+    else if t_start(t," th td ") then b_dispatch(b_insert_plain(b_clear_to(b," tbody tfoot thead template html "),"tr") with { mode=13 },t)
+    else if t_end(t," tbody tfoot thead ") then
+      (if b_in_scope(b,t_word(t.name),3) then b_pop(b_clear_to(b," tbody tfoot thead template html ")) with { mode=8 } else b)
+    else if t_start(t," caption col colgroup tbody tfoot thead ") || t_is_end(t,"table") then
+      (if b_in_scope(b," tbody thead tfoot ",3) then b_dispatch(b_pop(b_clear_to(b," tbody tfoot thead template html ")) with { mode=8 },t) else b)
+    else if t_end(t," body caption col colgroup html td th tr ") then b
+    else m_table(b,t)
+fn b_close_row(move b:HtmlBuilder) -> HtmlBuilder = b_pop(b_clear_to(b," tr template html ")) with { mode=12 }
+fn m_row(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t_start(t," th td ") then b_active_marker(b_insert_token(b_clear_to(b," tr template html "),t) with { mode=14 })
+    else if t_is_end(t,"tr") then (if b_in_scope(b," tr ",3) then b_close_row(b) else b)
+    else if t_start(t," caption col colgroup tbody tfoot thead tr ") || t_is_end(t,"table") then
+      (if b_in_scope(b," tr ",3) then b_dispatch(b_close_row(b),t) else b)
+    else if t_end(t," tbody tfoot thead ") then
+      (if b_in_scope(b,t_word(t.name),3) && b_in_scope(b," tr ",3) then b_dispatch(b_close_row(b),t) else b)
+    else if t_end(t," body caption col colgroup html td th ") then b
+    else m_table(b,t)
+fn b_close_cell(move b:HtmlBuilder) -> HtmlBuilder = b_active_clear(b_pop_until(b_implied(b,"")," td th ")) with { mode=13 }
+fn m_cell(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t_end(t," td th ") then
+      (if b_in_scope(b,t_word(t.name),3) then b_active_clear(b_pop_until(b_implied(b,""),t_word(t.name))) with { mode=13 } else b)
+    else if t_start(t," caption col colgroup tbody td tfoot th thead tr ") then
+      (if b_in_scope(b," td th ",3) then b_dispatch(b_close_cell(b),t) else b)
+    else if t_end(t," body caption col colgroup html ") then b
+    else if t_end(t," table tbody tfoot thead tr ") then (if b_in_scope(b,t_word(t.name),3) then b_dispatch(b_close_cell(b),t) else b)
+    else m_body(b,t)
+fn b_template_switch(move b:HtmlBuilder,mode:i64) -> HtmlBuilder = let x=b_templates_pop(b) in x with { templates=push(x.templates,mode),mode=mode }
+cold fn m_template(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 || t_comment(t) || t.kind==5 then m_body(b,t)
+    else if t_start(t," base basefont bgsound link meta noframes script style template title ") || t_is_end(t,"template") then m_in_head(b,t)
+    else if t_start(t," caption colgroup tbody tfoot thead ") then b_dispatch(b_template_switch(b,8),t)
+    else if t_is_start(t,"col") then b_dispatch(b_template_switch(b,11),t)
+    else if t_is_start(t,"tr") then b_dispatch(b_template_switch(b,12),t)
+    else if t_start(t," td th ") then b_dispatch(b_template_switch(b,13),t)
+    else if t.kind==2 then b_dispatch(b_template_switch(b,6),t)
+    else if t.kind==3 then b
+    else if !b_has_template(b) then b_stop(b)
+    else b_dispatch(b_reset(b_templates_pop(b_active_clear(b_pop_until(b," template ")))),t)
+fn m_after_body(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then
+      let cut=dom_space_prefix(t.text) in let x=if cut>0 then m_body(b,t with { text=str_slice(t.text,0,cut) }) else b in
+      if cut>=len(t.text) then x else b_dispatch(x with { mode=6 },t_rest(t,cut))
+    else if t_comment(t) then (let root=b_at(b,0) in b_comment_at(b,root,-1,t))
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_end(t,"html") then (if b.context>=0 then b else b with { mode=21 })
+    else if t.kind==6 then b_stop(b)
+    else b_dispatch(b with { mode=6 },t)
+cold fn m_frameset(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then b_text(b,dom_only_space(t.text))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_start(t,"frameset") then b_insert_token(b,t)
+    else if t_is_end(t,"frameset") then
+      (if b.depth<=1 then b else let x=b_pop(b) in if x.context<0 && !b_current_is(x,"frameset") then x with { mode=20 } else x)
+    else if t_is_start(t,"frame") then b_insert_void(b,t)
+    else if t_is_start(t,"noframes") then m_in_head(b,t)
+    else if t.kind==6 then b_stop(b)
+    else b
+cold fn m_after_frameset(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then b_text(b,dom_only_space(t.text))
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_is_start(t,"html") then m_body(b,t)
+    else if t_is_end(t,"html") then b with { mode=22 }
+    else if t_is_start(t,"noframes") then m_in_head(b,t)
+    else if t.kind==6 then b_stop(b)
+    else b
+cold fn m_after_after_body(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t_comment(t) then b_comment_at(b,0,-1,t)
+    else if t.kind==5 || t_is_start(t,"html") then m_body(b,t)
+    else if t.kind==1 then
+      let cut=dom_space_prefix(t.text) in let x=if cut>0 then m_body(b,t with { text=str_slice(t.text,0,cut) }) else b in
+      if cut>=len(t.text) then x else b_dispatch(x with { mode=6 },t_rest(t,cut))
+    else if t.kind==6 then b_stop(b)
+    else b_dispatch(b with { mode=6 },t)
+cold fn m_after_after_frameset(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t_comment(t) then b_comment_at(b,0,-1,t)
+    else if t.kind==5 || t_is_start(t,"html") then m_body(b,t)
+    else if t.kind==1 then (let space=dom_only_space(t.text) in if len(space)==0 then b else m_body(b,t with { text=space }))
+    else if t.kind==6 then b_stop(b)
+    else if t_is_start(t,"noframes") then m_in_head(b,t)
+    else b
+
+; ---- Foreign content (WHATWG 13.2.6.5) ------------------------------------------
+
+fn b_foreign_end_step(b:HtmlBuilder,t:html::HtmlToken,i:i64) -> i64
+  = if i<=0 then -2
+    else if str_equal(html::html_ascii_lower((b_node(b,b_at(b,i))).name),t.name) then i
+    else if (b_node(b,b_at(b,i-1))).ns==0 then -3
+    else -1
+fn b_foreign(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = if t.kind==1 then
+      let x=b_text(b,html::html_nul(t.text)) in if dom_all_space(dom_drop_nul(t.text)) then x else x with { frameset_ok=false }
+    else if t_comment(t) then b_comment(b,t)
+    else if t.kind==5 then b
+    else if t_start(t," b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 h5 h6 head hr i img li listing menu meta nobr ol p pre ruby s small span strong strike sub sup table tt u ul var ")
+      || t_is_start(t,"font") && (dom_attr_has(t.attributes,"color") || dom_attr_has(t.attributes,"face") || dom_attr_has(t.attributes,"size"))
+      || t_end(t," br p ") then
+      let x=loop(y=b) while y.depth>0 && (let d=b_node(y,b_current(y)) in d.ns!=0 && !dom_mathml_text_point(d) && !dom_html_point(d)) next(b_pop(y)) yield y in
+      b_mode(x,t)
+    else if t.kind==2 then
+      let ns=(b_node(b,b_adjusted(b))).ns in
+      let x=b_insert(b,if ns==1 then dom_svg_name(t.name) else str_slice(t.name,0,len(t.name)),ns,dom_foreign_attributes(t.attributes,ns)) in
+      if t.self_closing then b_pop(x) else x
+    else if t.kind==3 then
+      let found=loop(i=b.depth-1,found=-1) while found==-1 next(i-1,b_foreign_end_step(b,t,i)) yield found in
+      if found>=0 then b with { depth=found } else if found==-3 then b_mode(b,t) else b
+    else b_mode(b,t)
+
+; ---- Tree construction dispatcher ----------------------------------------------
+
+fn b_mode(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let m=b.mode in
+    if m==6 then m_body(b,t) else if m==7 then m_text(b,t) else if m==8 then m_table(b,t) else if m==9 then m_table_text(b,t)
+    else if m==12 then m_tbody(b,t) else if m==13 then m_row(b,t) else if m==14 then m_cell(b,t)
+    else if m==0 then m_initial(b,t) else if m==1 then m_before_html(b,t) else if m==2 then m_before_head(b,t)
+    else if m==3 then m_in_head(b,t) else if m==4 then m_in_head_noscript(b,t) else if m==5 then m_after_head(b,t)
+    else if m==10 then m_caption(b,t) else if m==11 then m_colgroup(b,t)
+    else if m==17 then m_template(b,t) else if m==18 then m_after_body(b,t)
+    else if m==19 then m_frameset(b,t) else if m==20 then m_after_frameset(b,t) else if m==21 then m_after_after_body(b,t)
+    else m_after_after_frameset(b,t)
+fn b_dispatch(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let a=b_adjusted(b) in let d=b_node(b,a) in
+    if a<0 || d.ns==0 || t.kind==6
+      || dom_mathml_text_point(d) && (t.kind==1 || t.kind==2 && !dom_listed(" mglyph malignmark ",t.name))
+      || dom_is(d,2,"annotation-xml") && t_is_start(t,"svg")
+      || dom_html_point(d) && (t.kind==1 || t.kind==2)
+    then b_mode(b,t) else b_foreign(b,t)
+; One token from the tokenizer; a newline right after <pre>, <listing> or <textarea> is dropped.
+fn b_token(move b:HtmlBuilder,t:html::HtmlToken) -> HtmlBuilder
+  = let skip=b.skip_newline && t.kind==1 && str_byte(t.text,0)==10 in
+    let token=if skip then t_rest(t,1) else t in
+    let x=b with { skip_newline=false } in
+    if token.kind==1 && len(token.text)==0 then x else b_dispatch(x,token)
+fn b_foreign_flag(b:HtmlBuilder) -> bool = let a=b_adjusted(b) in a>=0 && (b_node(b,a)).ns!=0
+
+; ---- Parsing --------------------------------------------------------------------
+
+fn dom_token_at(tokens:Vec<html::HtmlToken>,i:i64) -> html::HtmlToken
+  = match vec_get(tokens,i) { Some(t)=>t,None=>html::html_token(6,"","") }
+fn dom_parse_step(move p:HtmlParse,text:Arr u8 n) -> HtmlParse
+  = let seen=p.seen in
+    if p.scan.at>=n then HtmlParse { scan=p.scan,b=b_stop(b_token(p.b,html::html_token(6,"",""))),seen=seen } else
+    let foreign=b_foreign_flag(p.b) in
+    let scan=html::html_step(p.scan with { foreign=foreign },text) in
+    let count=vec_len(scan.tokens) in
+    if count<=seen then HtmlParse { scan=scan,b=p.b,seen=seen } else
+    let b=b_token(p.b,dom_token_at(scan.tokens,seen)) in let raw=b.raw in
+    ; Each step emits at most one token; dropping it keeps the token queue empty.
+    let drained=scan with { tokens=vec_pop(scan.tokens) } in
+    HtmlParse { scan=if len(raw)>0 then drained with { raw=raw } else drained,b=b with { raw="" },seen=seen }
+fn dom_run(text:Arr u8 n,move scan:html::HtmlScan,move b:HtmlBuilder) -> Dom
+  = let done=loop(p=HtmlParse { scan=scan,b=b,seen=0 }) while !p.b.done next(dom_parse_step(p,text)) yield p in done.b.dom
+; Parses a whole document. Node 0 is the document; its children are the tree.
+fn dom_parse(input:Arr u8 n) -> Dom = dom_parse_with(input,false)
+fn dom_parse_with(input:Arr u8 n,scripting:bool) -> Dom
+  = let text=html::html_input(input) in dom_run(text,html::html_scan(true),b_new(scripting))
+; Parses a fragment in the context of an element `context` in namespace `ns`
+; (WHATWG 13.4). The fragment's nodes are the children of the document's
+; first child, an html element.
+fn dom_parse_fragment(input:Arr u8 n,context:Arr u8 m,ns:i64,scripting:bool) -> Dom
+  = let text=html::html_input(input) in
+    let b0=b_new(scripting) in let context_id=dom_count(b0.dom) in
+    let b1=b0 with { dom=dom_element(b0.dom,context,ns,html::html_no_attributes()),context=context_id } in
+    let root=dom_count(b1.dom) in
+    let b2=b_push(b1 with { dom=dom_insert(dom_element(b1.dom,"html",0,html::html_no_attributes()),0,root,-1) },root) in
+    let b3=if ns==0 && str_equal(context,"template") then b2 with { templates=push(b2.templates,17) } else b2 in
+    let raw=if ns==0 && (dom_listed(" title textarea style xmp iframe noembed noframes script plaintext ",context) || scripting && str_equal(context,"noscript")) then context else "" in
+    dom_run(text,html::html_scan(true) with { raw=raw,orphan=len(raw)>0 },b_reset(b3))
+
+; ---- Reading the tree ----------------------------------------------------------
+
+fn dom_kind(dom:Dom,i:i64) -> i64 = (dom_node(dom,i)).kind
+fn dom_name(dom:Dom,i:i64) -> Arr u8 _ = (dom_node(dom,i)).name
+fn dom_namespace(dom:Dom,i:i64) -> i64 = (dom_node(dom,i)).ns
+fn dom_data(dom:Dom,i:i64) -> Arr u8 _ = (dom_node(dom,i)).text
+fn dom_attributes(dom:Dom,i:i64) -> Arr html::HtmlAttribute _ = (dom_node(dom,i)).attributes
+fn dom_attribute(dom:Dom,i:i64,name:Arr u8 n) -> OptionBytes
+  = let list=dom_attributes(dom,i) in let at=dom_attr_index(list,name) in if at<0 || at>=len(list) then none_bytes() else some_bytes(list[at].value)
+fn dom_parent(dom:Dom,i:i64) -> i64 = dom_get(dom.parent,i)
+fn dom_first_child(dom:Dom,i:i64) -> i64 = dom_get(dom.first,i)
+fn dom_last_child(dom:Dom,i:i64) -> i64 = dom_get(dom.last,i)
+fn dom_next_sibling(dom:Dom,i:i64) -> i64 = dom_get(dom.later,i)
+fn dom_previous_sibling(dom:Dom,i:i64) -> i64 = dom_get(dom.prior,i)
+; A template element's contents fragment, or -1.
+fn dom_template_content(dom:Dom,i:i64) -> i64 = dom_get(dom.content,i)
+fn dom_size(dom:Dom) -> i64 = dom_count(dom)
+fn dom_is_quirks(dom:Dom) -> bool = dom.quirks
+; The node after `i` in tree order within `root`'s subtree, or -1.
+fn dom_following(dom:Dom,root:i64,i:i64) -> i64
+  = let child=dom_get(dom.first,i) in if child>=0 then child else
+    loop(node=i,found=-2) while found==-2
+      next(dom_get(dom.parent,node),if node==root || node<0 then -1 else let sibling=dom_get(dom.later,node) in if sibling>=0 then sibling else -2)
+      yield found
+
+; The next node after `i`'s subtree in tree order, within `root`; -1 at the end.
+fn dom_skip(dom:Dom,root:i64,i:i64) -> i64
+  = loop(node=i,found=-2) while found==-2
+      next(dom_get(dom.parent,node),if node==root || node<0 then -1 else let sibling=dom_get(dom.later,node) in if sibling>=0 then sibling else -2)
+      yield found
+; Whether a form control is disabled, by its own attribute or a disabled fieldset ancestor.
+fn dom_disabled(dom:Dom,node:i64) -> bool = css_disabled(dom,node)
+
+; ---- Changing the tree ---------------------------------------------------------
+
+fn dom_set_attribute(move dom:Dom,node:i64,name:Arr u8 n,value:Arr u8 m) -> Dom
+  = let d=dom_node(dom,node) in let list=d.attributes in let at=dom_attr_index(list,name) in
+    let updated=if at<0 then push(list,html::html_attribute_new(name,value)) else arr(i in 0..len(list)) if i==at then list[i] with { value=str_slice(value,0,m) } else list[i] in
+    dom_update(dom,node,d with { attributes=updated })
+fn dom_remove_attribute(move dom:Dom,node:i64,name:Arr u8 n) -> Dom
+  = let d=dom_node(dom,node) in let list=d.attributes in let at=dom_attr_index(list,name) in
+    if at<0 then dom else
+    let kept=loop(i=0,out=html::html_no_attributes()) while i<len(list) next(i+1,check i>=0 && i<len(list) in if i==at then out else push(out,list[i])) yield out in
+    dom_update(dom,node,d with { attributes=kept })
+; Replaces the node's children with one text node (none when `text` is empty).
+fn dom_set_text_content(move dom:Dom,node:i64,text:Arr u8 n) -> Dom
+  = let emptied=loop(d=dom) while dom_get(d.first,node)>=0 next(let child=dom_get(d.first,node) in dom_detach(d,child)) yield d in
+    if n==0 then emptied else
+    let id=dom_count(emptied) in
+    dom_insert(dom_add(emptied,DomData { kind=3,ns=0,name="",text=str_slice(text,0,n),attributes=html::html_no_attributes() }),node,id,-1)
+
+; ---- html5lib test format -------------------------------------------------------
+
+fn dom_indent(depth:i64) -> Arr u8 _ = let count=if depth<0 then 0 else 2*depth in check count>=0 in arr(i in 0..count) u8(32)
+fn dom_display_name(d:DomData,name:Arr u8 n) -> Arr u8 _
+  = if d.ns!=0 && dom_listed(" xlink:actuate xlink:arcrole xlink:href xlink:role xlink:show xlink:title xlink:type xml:lang xml:space xmlns:xlink ",name)
+    then arr(i in 0..n) if name[i]==':' then u8(32) else name[i] else str_slice(name,0,n)
+fn dom_less(a:Arr u8 n,b:Arr u8 m) -> bool
+  = let i=loop(i=0) while i<n && i<m && str_byte(a,i)==str_byte(b,i) next(i+1) yield i in
+    if i>=n then n<m else if i>=m then false else str_byte(a,i)<str_byte(b,i)
+fn dom_pick(names:Arr Arr u8 _ n,i:i64) -> Arr u8 _ = if i>=0 && i<n then names[i] else ""
+; The index of the smallest name after names[prev] (any name when prev < 0).
+fn dom_next_name(names:Arr Arr u8 _ n,prev:i64) -> i64
+  = loop(i=0,best=-1) while i<n
+      next(i+1,if (prev<0 || dom_less(dom_pick(names,prev),dom_pick(names,i))) && (best<0 || dom_less(dom_pick(names,i),dom_pick(names,best))) then i else best)
+      yield best
+fn dom_dump_attributes(d:DomData,depth:i64,move out:Arr u8 k) -> Arr u8 _
+  = let list=d.attributes in let names=arr(i in 0..len(list)) dom_display_name(d,list[i].name) in
+    let done=loop(count=0,prev=-1,acc=out) while count<len(names)
+      next(count+1,dom_next_name(names,prev),
+        let at=dom_next_name(names,prev) in concat(acc,"| ",dom_indent(depth),dom_pick(names,at),"=\"",dom_attr(list,(if at>=0 && at<len(list) then list[at].name else "")),"\"\n"))
+      yield acc in
+    done
+fn dom_doctype_line(d:DomData) -> Arr u8 _
+  = if dom_attr_has(d.attributes,"public") || dom_attr_has(d.attributes,"system") then
+      concat("<!DOCTYPE ",d.name," \"",dom_attr(d.attributes,"public"),"\" \"",dom_attr(d.attributes,"system"),"\">")
+    else concat("<!DOCTYPE ",d.name,">")
+fn dom_dump_node(dom:Dom,id:i64,depth:i64,move out:Arr u8 k) -> Arr u8 _
+  = let d=dom_node(dom,id) in let pad=dom_indent(depth) in
+    if d.kind==3 then concat(out,"| ",pad,"\"",d.text,"\"\n")
+    else if d.kind==8 then concat(out,"| ",pad,"<!-- ",d.text," -->\n")
+    else if d.kind==7 then concat(out,"| ",pad,"<?",d.name," ",d.text,"?>\n")
+    else if d.kind==10 then concat(out,"| ",pad,dom_doctype_line(d),"\n")
+    else
+      let head=concat(out,"| ",pad,"<",if d.ns==1 then "svg " else if d.ns==2 then "math " else "",d.name,">\n") in
+      let attributes=dom_dump_attributes(d,depth+1,head) in
+      let content=dom_get(dom.content,id) in
+      let filled=if content>=0 then dom_dump_children(dom,content,depth+2,concat(attributes,"| ",dom_indent(depth+1),"content\n")) else attributes in
+      dom_dump_children(dom,id,depth+1,filled)
+fn dom_dump_children(dom:Dom,parent:i64,depth:i64,move out:Arr u8 k) -> Arr u8 _
+  = loop(child=dom_get(dom.first,parent),acc=out) while child>=0 next(dom_get(dom.later,child),dom_dump_node(dom,child,depth,acc)) yield acc
+; The subtree under `parent` in the html5lib-tests tree format.
+fn dom_dump(dom:Dom,parent:i64) -> Arr u8 _ = dom_dump_children(dom,parent,0,"")
+
+; ---- CSS selectors (Selectors Level 4 subset) -----------------------------------
+;
+; Type, universal, #id, .class and attribute selectors ([a], =, ~=, |=, ^=, $=,
+; *=, with i/s flags); the combinators descendant, >, + and ~; selector lists;
+; :not(), :is(), :where(); :nth-child(An+B [of S]), :nth-last-child(),
+; :nth-of-type(), :nth-last-of-type() and the first/last/only forms; :root,
+; :empty, :scope, :link, :any-link, :checked, :disabled, :enabled, :required,
+; :optional, :read-only, :read-write, :placeholder-shown, :defined. User-action
+; and history pseudo-classes (:hover, :focus, :visited...) never match. Not
+; supported (a parse error): pseudo-elements, :has(), namespaces.
+;
+; A compiled selector is a set of linked tables, so nesting needs no recursive
+; types: each complex selector points to its rightmost compound, each compound
+; to the compound on its left and its first simple selector, and lists and
+; compounds chain through `link` (their order does not matter for matching).
+; Simple kinds: 1 type, 2 id, 3 class, 4 attribute (op: 0 present, 1 =, 2 ~=,
+; 3 |=, 4 ^=, 5 $=, 6 *=; flag: 0 default, 1 i, 2 s), 5 pseudo-class, 6 nth
+; (a, b; list: the "of S" list or -1), 7 :not(list), 8 :is()/:where().
+type CssSimple = { kind:i64,name:Arr u8 _,value:Arr u8 _,op:i64,flag:i64,a:i64,b:i64,list:i64,link:i64 }
+type CssCompound = { simples:i64,left:i64,combinator:i64 }
+type CssComplex = { last:i64,link:i64 }
+type Css = { ok:bool,error:Arr u8 _,simples:Vec<CssSimple>,compounds:Vec<CssCompound>,complexes:Vec<CssComplex>,root:i64 }
+type CssParse = { css:Css,at:i64,value:i64,more:bool }
+type CssWord = { value:Arr u8 _,end:i64 }
+
+fn css_fail(move p:CssParse,message:Arr u8 n) -> CssParse
+  = if !p.css.ok then p else p with { css=p.css with { ok=false,error=concat(message," at offset ",int_text(p.at)) } }
+fn css_space(c:i64) -> bool = c==32 || c==9 || c==10 || c==12 || c==13
+fn css_skip(text:Arr u8 n,at:i64) -> i64 = loop(i=at) while css_space(str_byte(text,i)) next(i+1) yield i
+fn css_name_char(c:i64) -> bool = html::html_alpha(c) || html::html_digit(c) || c==45 || c==95 || c>=128 || c==92
+fn css_name_start(text:Arr u8 n,at:i64) -> bool
+  = let c=str_byte(text,at) in let d=if c==45 then str_byte(text,at+1) else c in
+    html::html_alpha(d) || d==95 || d>=128 || d==92 || c==45 && d==45
+fn css_hex(c:i64) -> i64 = if c>=48 && c<=57 then c-48 else if c>=97 && c<=102 then c-87 else if c>=65 && c<=70 then c-55 else -1
+; One escape after a backslash at `at`: up to six hex digits (and one following space) or one literal byte.
+fn css_escape(text:Arr u8 n,at:i64) -> CssWord
+  = let digits=loop(i=at+1,count=0) while count<6 && css_hex(str_byte(text,i))>=0 next(i+1,count+1) yield count in
+    if digits==0 then (if at+1>=n then CssWord { value="\xef\xbf\xbd",end=n } else CssWord { value=str_slice(text,at+1,at+2),end=at+2 }) else
+    let code=loop(i=at+1,v=0) while i<at+1+digits next(i+1,v*16+css_hex(str_byte(text,i))) yield v in
+    let end=at+1+digits in let after=if css_space(str_byte(text,end)) then end+1 else end in
+    let fixed=if code==0 || code>1114111 || code>=55296 && code<=57343 then 65533 else code in
+    let encoded=utf8_encode(fixed) in CssWord { value=if encoded.ok then encoded.value else "\xef\xbf\xbd",end=after }
+fn css_name(text:Arr u8 n,at:i64) -> CssWord
+  = loop(word=CssWord { value="",end=at }) while word.end<n && css_name_char(str_byte(text,word.end))
+      next(if str_byte(text,word.end)==92 then (let e=css_escape(text,word.end) in CssWord { value=concat(word.value,e.value),end=e.end })
+        else let stop=loop(i=word.end) while i<n && css_name_char(str_byte(text,i)) && str_byte(text,i)!=92 next(i+1) yield i in
+          CssWord { value=concat(word.value,str_slice(text,word.end,stop)),end=stop })
+      yield word
+fn css_string(text:Arr u8 n,at:i64) -> CssWord
+  = let quote=str_byte(text,at) in
+    loop(word=CssWord { value="",end=at+1 },done=false) while !done && word.end<n
+      next(let c=str_byte(text,word.end) in
+          if c==quote then word with { end=word.end+1 }
+          else if c==92 then (let e=css_escape(text,word.end) in CssWord { value=concat(word.value,e.value),end=e.end })
+          else CssWord { value=concat(word.value,str_slice(text,word.end,word.end+1)),end=word.end+1 },
+        str_byte(text,word.end)==quote)
+      yield word
+fn css_add_simple(move p:CssParse,s:CssSimple,head:i64) -> CssParse
+  = let id=vec_len(p.css.simples) in p with { css=p.css with { simples=vec_push(p.css.simples,s with { link=head }) },value=id }
+fn css_simple(kind:i64,name:Arr u8 n,value:Arr u8 m) -> CssSimple
+  = CssSimple { kind=kind,name=name,value=value,op=0,flag=0,a=0,b=0,list=-1,link=-1 }
+; An+B (CSS Syntax 6.1), with odd and even.
+type CssNth = { ok:bool,a:i64,b:i64,end:i64 }
+fn css_int(text:Arr u8 n,at:i64) -> CssNth
+  = let end=loop(i=at) while html::html_digit(str_byte(text,i)) next(i+1) yield i in
+    let value=int_parse(str_slice(text,at,end)) in CssNth { ok=end>at && value.ok,a=0,b=if value.ok then value.value else 0,end=end }
+fn css_nth(text:Arr u8 n,from:i64) -> CssNth
+  = let at=css_skip(text,from) in
+    if html::html_starts_ci(text,at,"odd") then CssNth { ok=true,a=2,b=1,end=at+3 }
+    else if html::html_starts_ci(text,at,"even") then CssNth { ok=true,a=2,b=0,end=at+4 }
+    else
+      let sign=str_byte(text,at) in let signed=sign==43 || sign==45 in let start=if signed then at+1 else at in
+      let digits=css_int(text,start) in
+      let c=str_byte(text,digits.end) in
+      if c==110 || c==78 then
+        let a=(if digits.ok then digits.b else 1)*(if sign==45 then -1 else 1) in
+        let after=css_skip(text,digits.end+1) in let op=str_byte(text,after) in
+        if op==43 || op==45 then
+          let num=css_int(text,css_skip(text,after+1)) in CssNth { ok=num.ok,a=a,b=if op==45 then -num.b else num.b,end=num.end }
+        else CssNth { ok=true,a=a,b=0,end=digits.end+1 }
+      else CssNth { ok=digits.ok,a=0,b=if sign==45 then -digits.b else digits.b,end=digits.end }
+fn css_attribute(move p:CssParse,text:Arr u8 n,head:i64) -> CssParse
+  = let at=css_skip(text,p.at+1) in let name=css_name(text,at) in
+    if len(name.value)==0 then css_fail(p with { at=at },"expected an attribute name") else
+    let after=css_skip(text,name.end) in let c=str_byte(text,after) in
+    if c==93 then css_add_simple(p with { at=after+1 },css_simple(4,html::html_ascii_lower(name.value),name.value),head) else
+    let op=if c==61 then 1 else if str_byte(text,after+1)!=61 then -1 else if c==126 then 2 else if c==124 then 3 else if c==94 then 4 else if c==36 then 5 else if c==42 then 6 else -1 in
+    if op<0 then css_fail(p with { at=after },"expected an attribute operator") else
+    let vat=css_skip(text,after+(if op==1 then 1 else 2)) in let q=str_byte(text,vat) in
+    let value=if q==34 || q==39 then css_string(text,vat) else css_name(text,vat) in
+    if value.end==vat then css_fail(p with { at=vat },"expected an attribute value") else
+    let fat=css_skip(text,value.end) in let f=str_byte(text,fat) in
+    let flag=if f==105 || f==73 then 1 else if f==115 || f==83 then 2 else 0 in
+    let close=css_skip(text,if flag>0 then fat+1 else fat) in
+    if str_byte(text,close)!=93 then css_fail(p with { at=close },"expected ]") else
+    css_add_simple(p with { at=close+1 },css_simple(4,html::html_ascii_lower(name.value),value.value) with { op=op,flag=flag },head)
+fn css_pseudo(move p:CssParse,text:Arr u8 n,head:i64) -> CssParse
+  = if str_byte(text,p.at+1)==58 then css_fail(p,"pseudo-elements are not supported") else
+    let word=css_name(text,p.at+1) in let name=html::html_ascii_lower(word.value) in
+    if len(name)==0 then css_fail(p,"expected a pseudo-class name") else
+    if str_byte(text,word.end)!=40 then
+      (if dom_listed(" root empty scope link any-link checked disabled enabled required optional read-only read-write placeholder-shown defined first-child last-child only-child first-of-type last-of-type only-of-type hover active focus focus-visible focus-within visited target target-within ",name)
+        then css_add_simple(p with { at=word.end },css_simple(5,name,""),head) else css_fail(p,concat("unsupported pseudo-class :",name)))
+    else if dom_listed(" not is where matches ",name) then
+      let inner=css_list(p with { at=word.end+1 },text) in let close=css_skip(text,inner.at) in
+      if !inner.css.ok then inner else if str_byte(text,close)!=41 then css_fail(inner with { at=close },"expected )") else
+      let list=inner.value in css_add_simple(inner with { at=close+1 },css_simple(if str_equal(name,"not") then 7 else 8,name,"") with { list=list },head)
+    else if dom_listed(" nth-child nth-last-child nth-of-type nth-last-of-type ",name) then
+      let nth=css_nth(text,word.end+1) in
+      if !nth.ok then css_fail(p with { at=word.end+1 },"expected An+B") else
+      let after=css_skip(text,nth.end) in
+      let of=dom_listed(" nth-child nth-last-child ",name) && html::html_starts_ci(text,after,"of") && css_space(str_byte(text,after+2)) in
+      let inner=if of then css_list(p with { at=after+2 },text) else p with { at=after,value=-1 } in
+      let close=css_skip(text,inner.at) in
+      if !inner.css.ok then inner else if str_byte(text,close)!=41 then css_fail(inner with { at=close },"expected )") else
+      let list=inner.value in css_add_simple(inner with { at=close+1 },css_simple(6,name,"") with { a=nth.a,b=nth.b,list=list },head)
+    else css_fail(p,concat("unsupported pseudo-class :",name,"()"))
+; One compound selector; value is its first simple selector (-1: universal only).
+fn css_compound_step(move p:CssParse,text:Arr u8 n) -> CssParse
+  = let c=str_byte(text,p.at) in let head=p.value in
+    if c==42 then p with { at=p.at+1 }
+    else if c==35 || c==46 then
+      (let word=css_name(text,p.at+1) in if len(word.value)==0 then css_fail(p,"expected a name") else css_add_simple(p with { at=word.end },css_simple(if c==35 then 2 else 3,word.value,word.value),head))
+    else if c==91 then css_attribute(p,text,head)
+    else if c==58 then css_pseudo(p,text,head)
+    else (let word=css_name(text,p.at) in css_add_simple(p with { at=word.end },css_simple(1,html::html_ascii_lower(word.value),word.value),head))
+fn css_compound_more(text:Arr u8 n,at:i64) -> bool
+  = let c=str_byte(text,at) in c==42 || c==35 || c==46 || c==91 || c==58 || css_name_start(text,at)
+fn css_compound(move p:CssParse,text:Arr u8 n,left:i64,combinator:i64) -> CssParse
+  = if !css_compound_more(text,p.at) then css_fail(p,"expected a selector") else
+    let done=loop(q=p with { value=-1 }) while q.css.ok && css_compound_more(text,q.at) next(css_compound_step(q,text)) yield q in
+    if !done.css.ok then done else
+    let id=vec_len(done.css.compounds) in let simples=done.value in
+    done with { css=done.css with { compounds=vec_push(done.css.compounds,CssCompound { simples=simples,left=left,combinator=combinator }) },value=id }
+; A complex selector; value is its rightmost compound.
+fn css_complex_step(move p:CssParse,text:Arr u8 n) -> CssParse
+  = let at=css_skip(text,p.at) in let c=str_byte(text,at) in let left=p.value in
+    if c==62 || c==43 || c==126 then css_compound(p with { at=css_skip(text,at+1) },text,left,if c==62 then 2 else if c==43 then 3 else 4)
+    else css_compound(p with { at=at },text,left,1)
+fn css_complex_more(text:Arr u8 n,at:i64) -> bool
+  = let after=css_skip(text,at) in let c=str_byte(text,after) in
+    c==62 || c==43 || c==126 || after>at && css_compound_more(text,after)
+fn css_complex(move p:CssParse,text:Arr u8 n) -> CssParse
+  = let first=css_compound(p with { at=css_skip(text,p.at) },text,-1,0) in
+    loop(q=first) while q.css.ok && css_complex_more(text,q.at) next(css_complex_step(q,text)) yield q
+; A comma-separated list; value is its first complex selector.
+fn css_list_step(move p:CssParse,text:Arr u8 n) -> CssParse
+  = let head=p.value in let complex=css_complex(p,text) in
+    if !complex.css.ok then complex else
+    let id=vec_len(complex.css.complexes) in let last=complex.value in
+    let added=complex with { css=complex.css with { complexes=vec_push(complex.css.complexes,CssComplex { last=last,link=head }) },value=id } in
+    let after=css_skip(text,added.at) in if str_byte(text,after)==44 then added with { at=after+1,more=true } else added with { more=false }
+fn css_list(move p:CssParse,text:Arr u8 n) -> CssParse
+  = loop(q=css_list_step(p with { value=-1 },text)) while q.css.ok && q.more next(css_list_step(q,text)) yield q
+; Compiles a selector list. Check `ok`; `error` explains a failure.
+fn css_parse(text:Arr u8 n) -> Css
+  = let empty=Css { ok=true,error="",simples=vec_empty::<CssSimple>(),compounds=vec_empty::<CssCompound>(),complexes=vec_empty::<CssComplex>(),root=-1 } in
+    let parsed=css_list(CssParse { css=empty,at=0,value=-1,more=false },text) in
+    let end=css_skip(text,parsed.at) in
+    let checked=if parsed.css.ok && end<n then css_fail(parsed with { at=end },"unexpected character") else parsed in
+    let root=checked.value in checked.css with { root=root }
+
+fn css_simple_at(css:Css,i:i64) -> CssSimple = match vec_get(css.simples,i) { Some(s)=>s,None=>css_simple(0,"","") }
+fn css_compound_at(css:Css,i:i64) -> CssCompound = match vec_get(css.compounds,i) { Some(c)=>c,None=>CssCompound { simples=-1,left=-1,combinator=0 } }
+fn css_complex_at(css:Css,i:i64) -> CssComplex = match vec_get(css.complexes,i) { Some(c)=>c,None=>CssComplex { last=-1,link=-1 } }
+fn css_simple_link(css:Css,i:i64) -> i64 = let s=css_simple_at(css,i) in s.link
+fn css_complex_link(css:Css,i:i64) -> i64 = let c=css_complex_at(css,i) in c.link
+fn css_complex_last(css:Css,i:i64) -> i64 = let c=css_complex_at(css,i) in c.last
+fn css_fold_equal(a:Arr u8 n,b:Arr u8 m,fold:bool) -> bool = if fold then str_equal(html::html_ascii_lower(a),html::html_ascii_lower(b)) else str_equal(a,b)
+; Whether `token` is one of the whitespace-separated words of `list`.
+fn css_has_word(list:Arr u8 n,token:Arr u8 m,fold:bool) -> bool
+  = m>0 && loop(i=0,found=false) while !found && i<n
+      next(let start=css_skip(list,i) in loop(j=start) while j<n && !css_space(str_byte(list,j)) next(j+1) yield j,
+        let start=css_skip(list,i) in let end=loop(j=start) while j<n && !css_space(str_byte(list,j)) next(j+1) yield j in
+        end>start && css_fold_equal(str_slice(list,start,end),token,fold))
+      yield found
+fn css_attribute_match(s:CssSimple,value:Arr u8 n,fold:bool) -> bool
+  = let v=if fold then html::html_ascii_lower(value) else str_slice(value,0,n) in let w=if fold then html::html_ascii_lower(s.value) else s.value in
+    let k=len(w) in
+    if s.op==1 then str_equal(v,w)
+    else if s.op==2 then css_has_word(v,w,false)
+    else if s.op==3 then str_equal(v,w) || str_starts(v,concat(w,"-"))
+    else if s.op==4 then k>0 && str_starts(v,w)
+    else if s.op==5 then k>0 && k<=len(v) && str_equal(str_slice(v,len(v)-k,len(v)),w)
+    else k>0 && str_find(v,w).present
+fn css_element_sibling(dom:Dom,node:i64,forward:bool) -> i64
+  = loop(i=if forward then dom_get(dom.later,node) else dom_get(dom.prior,node)) while i>=0 && dom_kind(dom,i)!=1
+      next(if forward then dom_get(dom.later,i) else dom_get(dom.prior,i)) yield i
+; 1-based position among element siblings, counted from the start or the end,
+; optionally only same-type siblings or those matching the "of S" list.
+fn css_position(dom:Dom,css:Css,node:i64,from_end:bool,typed:bool,list:i64,scope:i64) -> i64
+  = let d=dom_node(dom,node) in
+    loop(i=node,count=0) while i>=0
+      next(css_element_sibling(dom,i,from_end),
+        let e=dom_node(dom,i) in if (!typed || e.ns==d.ns && str_equal(e.name,d.name)) && (list<0 || css_match_list(dom,css,list,i,scope)) then count+1 else count)
+      yield count
+fn css_nth_match(a:i64,b:i64,index:i64) -> bool
+  = if a==0 then index==b else let diff=index-b in diff%a==0 && diff/a>=0
+fn css_form_control(d:DomData) -> bool = dom_is_in(d,0," button input select textarea optgroup option fieldset ")
+fn css_disabled(dom:Dom,node:i64) -> bool
+  = let d=dom_node(dom,node) in css_form_control(d) &&
+    (dom_attr_has(d.attributes,"disabled") || loop(i=dom_get(dom.parent,node),found=false) while !found && i>=0
+      next(dom_get(dom.parent,i),let p=dom_node(dom,i) in dom_is(p,0,"fieldset") && dom_attr_has(p.attributes,"disabled")) yield found)
+fn css_pseudo_match(dom:Dom,name:Arr u8 n,node:i64,scope:i64) -> bool
+  = let d=dom_node(dom,node) in
+    if str_equal(name,"root") then dom_kind(dom,dom_get(dom.parent,node))==9
+    else if str_equal(name,"scope") then node==scope || dom_kind(dom,scope)==9 && dom_kind(dom,dom_get(dom.parent,node))==9
+    else if str_equal(name,"empty") then
+      loop(c=dom_get(dom.first,node),empty=true) while empty && c>=0
+        next(dom_get(dom.later,c),let k=dom_node(dom,c) in !(k.kind==1 || k.kind==3 && len(k.text)>0)) yield empty
+    else if str_equal(name,"first-child") then css_element_sibling(dom,node,false)<0
+    else if str_equal(name,"last-child") then css_element_sibling(dom,node,true)<0
+    else if str_equal(name,"only-child") then css_element_sibling(dom,node,false)<0 && css_element_sibling(dom,node,true)<0
+    else if dom_listed(" first-of-type last-of-type only-of-type ",name) then
+      let css=css_parse("*") in
+      let first=css_position(dom,css,node,false,true,-1,scope)==1 in let last=css_position(dom,css,node,true,true,-1,scope)==1 in
+      if str_equal(name,"first-of-type") then first else if str_equal(name,"last-of-type") then last else first && last
+    else if str_equal(name,"link") || str_equal(name,"any-link") then dom_is_in(d,0," a area ") && dom_attr_has(d.attributes,"href")
+    else if str_equal(name,"checked") then
+      dom_is(d,0,"input") && dom_attr_has(d.attributes,"checked") && dom_listed(" checkbox radio ",html::html_ascii_lower(dom_attr(d.attributes,"type")))
+      || dom_is(d,0,"option") && dom_attr_has(d.attributes,"selected")
+    else if str_equal(name,"disabled") then css_disabled(dom,node)
+    else if str_equal(name,"enabled") then css_form_control(d) && !css_disabled(dom,node)
+    else if str_equal(name,"required") then dom_is_in(d,0," input select textarea ") && dom_attr_has(d.attributes,"required")
+    else if str_equal(name,"optional") then dom_is_in(d,0," input select textarea ") && !dom_attr_has(d.attributes,"required")
+    else if str_equal(name,"read-write") then css_read_write(dom,node)
+    else if str_equal(name,"read-only") then !css_read_write(dom,node)
+    else if str_equal(name,"placeholder-shown") then dom_is_in(d,0," input textarea ") && dom_attr_has(d.attributes,"placeholder") && len(dom_attr(d.attributes,"value"))==0
+    else str_equal(name,"defined")
+; Mutable text controls: a textarea, or an input whose type takes readonly, not readonly or disabled.
+fn css_read_write(dom:Dom,node:i64) -> bool
+  = let d=dom_node(dom,node) in
+    let editable=dom_is(d,0,"textarea") || dom_is(d,0,"input") &&
+      (let t=html::html_ascii_lower(dom_attr(d.attributes,"type")) in len(t)==0 || dom_listed(" text search url tel email password date month week time datetime-local number ",t)) in
+    editable && !dom_attr_has(d.attributes,"readonly") && !css_disabled(dom,node)
+; Attributes whose values HTML compares without case in selectors.
+fn css_legacy_fold(name:Arr u8 n) -> bool
+  = dom_listed(" accept accept-charset align alink axis bgcolor charset checked clear codetype color compact declare defer dir direction disabled enctype face frame hreflang http-equiv lang language link media method multiple nohref noresize noshade nowrap readonly rel rev rules scope scrolling selected shape target text type valign valuetype vlink ",name)
+fn css_simple_match(dom:Dom,css:Css,s:CssSimple,node:i64,scope:i64) -> bool
+  = let d=dom_node(dom,node) in
+    if s.kind==1 then (if d.ns==0 then str_equal(d.name,s.name) else str_equal(d.name,s.value))
+    else if s.kind==2 then dom_attr_has(d.attributes,"id") && css_fold_equal(dom_attr(d.attributes,"id"),s.value,dom.quirks)
+    else if s.kind==3 then css_has_word(dom_attr(d.attributes,"class"),s.value,dom.quirks)
+    else if s.kind==4 then
+      let name=if d.ns==0 then s.name else s.value in
+      dom_attr_has(d.attributes,name) && (s.op==0 || css_attribute_match(s,dom_attr(d.attributes,name),s.flag==1 || s.flag==0 && d.ns==0 && css_legacy_fold(s.name)))
+    else if s.kind==5 then css_pseudo_match(dom,s.name,node,scope)
+    else if s.kind==6 then
+      let from_end=dom_listed(" nth-last-child nth-last-of-type ",s.name) in let typed=dom_listed(" nth-of-type nth-last-of-type ",s.name) in
+      (s.list<0 || css_match_list(dom,css,s.list,node,scope)) && css_nth_match(s.a,s.b,css_position(dom,css,node,from_end,typed,s.list,scope))
+    else if s.kind==7 then !css_match_list(dom,css,s.list,node,scope)
+    else if s.kind==8 then css_match_list(dom,css,s.list,node,scope)
+    else false
+fn css_compound_match(dom:Dom,css:Css,c:CssCompound,node:i64,scope:i64) -> bool
+  = dom_kind(dom,node)==1 && loop(i=c.simples,ok=true) while ok && i>=0
+      next(css_simple_link(css,i),css_simple_match(dom,css,css_simple_at(css,i),node,scope)) yield ok
+fn css_complex_match(dom:Dom,css:Css,compound:i64,node:i64,scope:i64) -> bool
+  = let c=css_compound_at(css,compound) in
+    if !css_compound_match(dom,css,c,node,scope) then false
+    else if c.left<0 then true
+    else if c.combinator==2 then css_complex_match(dom,css,c.left,dom_get(dom.parent,node),scope)
+    else if c.combinator==3 then css_complex_match(dom,css,c.left,css_element_sibling(dom,node,false),scope)
+    else if c.combinator==4 then
+      loop(i=css_element_sibling(dom,node,false),found=false) while !found && i>=0
+        next(css_element_sibling(dom,i,false),css_complex_match(dom,css,c.left,i,scope)) yield found
+    else loop(i=dom_get(dom.parent,node),found=false) while !found && i>=0
+        next(dom_get(dom.parent,i),css_complex_match(dom,css,c.left,i,scope)) yield found
+fn css_match_list(dom:Dom,css:Css,list:i64,node:i64,scope:i64) -> bool
+  = loop(i=list,found=false) while !found && i>=0
+      next(css_complex_link(css,i),css_complex_match(dom,css,css_complex_last(css,i),node,scope)) yield found
+; Element.matches(): whether `node` matches the compiled selector.
+fn dom_matches(dom:Dom,node:i64,css:Css) -> bool = css.ok && css_match_list(dom,css,css.root,node,node)
+; querySelectorAll(): the elements under `scope` (not `scope` itself) that match, in tree order.
+fn dom_query_all(dom:Dom,scope:i64,css:Css) -> Arr i64 _
+  = if !css.ok then dom_ints() else
+    loop(i=dom_following(dom,scope,scope),out=dom_ints()) while i>=0
+      next(dom_following(dom,scope,i),if dom_kind(dom,i)==1 && css_match_list(dom,css,css.root,i,scope) then push(out,i) else out) yield out
+; querySelector(): the first match under `scope`, or -1.
+fn dom_query(dom:Dom,scope:i64,css:Css) -> i64
+  = if !css.ok then -1 else
+    loop(i=dom_following(dom,scope,scope),found=-1) while found<0 && i>=0
+      next(dom_following(dom,scope,i),if dom_kind(dom,i)==1 && css_match_list(dom,css,css.root,i,scope) then i else -1) yield found
+; textContent: the concatenated text of every descendant text node.
+fn dom_text_content(dom:Dom,node:i64) -> Arr u8 _
+  = if dom_kind(dom,node)==3 then dom_data(dom,node) else
+    loop(i=dom_following(dom,node,node),out="") while i>=0 next(dom_following(dom,node,i),if dom_kind(dom,i)==3 then concat(out,dom_data(dom,i)) else out) yield out

@@ -1,0 +1,48 @@
+import "pkg:providers" as provider
+import "pkg:mcp" as mcp
+import "std:https_client"
+import "std:fs"
+import "std:process"
+import "std:debug"
+import "std:vec"
+import "std:json"
+private fn one(text:Arr u8 _) -> Arr Arr u8 _ _ = arr(i in 0..1) text
+private fn none() -> Arr Arr u8 _ _ = arr(i in 0..0) ""
+type Turn = { ok:bool,items:Json,calls:Vec<provider::ProviderCall>,text:Arr u8 _ }
+private fn turn_collect(move turn:Turn,events:Vec<provider::ProviderEvent>) -> Turn
+  = loop(i=0,turn=turn) while i<vec_len(events) next(i+1,match vec_get(events,i) { None => turn,Some(e) =>
+      if str_equal(e.kind,"tool_ready") then turn with { calls=vec_push(turn.calls,e.call) } else
+      if str_equal(e.kind,"text") then turn with { text=concat(turn.text,e.text) } else turn }) yield turn
+private effect(net,time,process) fn turn(io:HttpIO<TLSHTTPCapture>,body:Arr u8 _,deadline:i64) -> Turn
+  = let headers=arr(i in 0..2) if i==0 then HttpHeader { name="Authorization",value="Bearer test-token" } else HttpHeader { name="Content-Type",value="application/json" } in
+    let started=provider::responses_http_start(io,"localhost","/v1/responses",body,headers,deadline) in
+    let result=loop(state=started,turn=Turn { ok=started.ok,items=json_parse("[]").value,calls=vec_empty::<provider::ProviderCall>(),text="" }) while state.ok && !state.done next(
+      provider::responses_http_read(state,deadline),turn_collect(turn,state.events)) yield
+        let collected=turn_collect(turn,state.events) in collected with { ok=state.ok,items=provider::responses_items(state.stream) } in result
+private effect(fs,net,time,process) fn provider_turn(port:i64,roots:Arr Certificate _,body:Arr u8 _,deadline:i64,cancellation:Cancellation) -> Turn
+  = using arena=new_arena(4) in using socket=tcp_connect_ipv4_cancel("127.0.0.1",port,deadline,cancellation) in let status=socket_status(socket) in check status.ok in
+    let connection=adopt(socket,arena) in using tls=tls_connect_cancel(borrow_ref(connection),"localhost",roots,deadline,cancellation) in let status=tls_status(tls) in check status.ok in
+    let session=adopt(tls,arena) in turn(http_tls_transport(connection,session),body,deadline)
+private effect(fs,net,env,time,process) fn exercise(port:i64,root:Arr u8 _,executable:Arr u8 _,script:Arr u8 _,state_path:Arr u8 _) -> unit
+  = using arena=new_arena(8) in using child=process_start(executable,one(script),none()) in let process=adopt(child,arena) in
+    using cancellation=new_cancellation() in let cancel_ref=adopt(cancellation,arena) in let timer=deadline_after(6000) in
+    let initialized=mcp::mcp_initialize(mcp::mcp_new(mcp::mcp_process_transport(process,cancel_ref)),timer.value) in check initialized.ok in
+    let listed=mcp::mcp_tools_list(initialized.state,"",timer.value) in check listed.ok in
+    let definitions=json_array_values(json_get(listed.result,"tools").value) in
+    let tools=json_value_array(arr(i in 0..len(definitions)) let tool=definitions[i] in json_parse(concat("{\"type\":\"function\",\"name\":",json_encode(json_get(tool,"name").value),",\"parameters\":",json_encode(json_get(tool,"inputSchema").value),"}")).value).value in
+    let input=json_parse("[{\"role\":\"user\",\"content\":\"What is 20 + 22?\"}]").value in
+    let certificate=fs_read(root) in check certificate.ok in let roots=arr(i in 0..1) x509_parse(certificate.value) in
+    let first=provider_turn(port,roots,provider::responses_request("test-model",input,tools).value,timer.value,borrow_ref(cancel_ref)) in
+    check first.ok && vec_len(first.calls)==1 in
+    let call=match vec_get(first.calls,0) { None => check false in provider::ProviderCall { index=0,item="",id="",name="",arguments="",done=false },Some(call) => call } in
+    let executed=mcp::mcp_tools_call(listed.state,call.name,json_parse(call.arguments).value,timer.value) in check executed.ok in
+    let output=provider::responses_tool_output(call.id,json_encode(executed.result)) in check output.ok in
+    let inputs=provider::responses_continue(input,first.items,json_value_array(arr(i in 0..1) output.value).value) in check inputs.ok in
+    let second=provider_turn(port,roots,provider::responses_request("test-model",inputs.value,tools).value,timer.value,borrow_ref(cancel_ref)) in check second.ok && vec_len(second.calls)==0 in
+    let snapshot=concat("{\"input\":",json_encode(inputs.value),",\"answer\":",json_quote(second.text),",\"tools_executed\":1}") in
+    let saved=fs_atomic_replace(state_path,snapshot) in check saved.ok in let loaded=fs_read(state_path) in check loaded.ok && str_equal(loaded.value,snapshot) in
+    let printed=print_out(concat(second.text,"\n")) in noop()
+effect(fs,net,env,time,process) fn main() -> unit
+  = let port=int_parse(cli_arg(1).value) in check port.ok in let baseline=live_resources() in
+    let done=exercise(port.value,cli_arg(2).value,cli_arg(3).value,cli_arg(4).value,cli_arg(5).value) in
+    let live=live_resources() in check live==baseline in noop()

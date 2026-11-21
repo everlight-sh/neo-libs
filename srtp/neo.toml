@@ -1,0 +1,6 @@
+[package]
+name="neo-srtp"
+version="0.1.0"
+entry="src/lib.neo"
+[dependencies]
+rtp={path="../rtp",version="0.1.0"}

@@ -1,0 +1,7 @@
+build/
+.axon-build/
+__pycache__/
+*.pyc
+.neo-build/
+core
+core.[0-9]*

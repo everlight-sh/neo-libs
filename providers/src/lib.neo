@@ -1,0 +1,110 @@
+import "std:http_client"
+import "std:json"
+import "std:sse"
+import "std:vec"
+
+; OpenAI Responses text/function-call profile. Opaque completed output items
+; (including encrypted reasoning) are preserved for stateless continuation.
+; No network, credentials, model choice or application policy lives here.
+type ProviderCall = { index:i64,item:Arr u8 _,id:Arr u8 _,name:Arr u8 _,arguments:Arr u8 _,done:bool }
+type ProviderEvent = { kind:Arr u8 _,text:Arr u8 _,call:ProviderCall,value:Json }
+sealed type Responses = { response:Arr u8 _,sequence:i64,calls:Vec<ProviderCall>,items:Vec<Json>,text_bytes:i64,terminal:bool,failed:bool }
+type ProviderFeed = { state:Responses,events:Vec<ProviderEvent>,ok:bool,error:Error }
+fn responses_new() -> Responses
+  = Responses { response="",sequence= -1,calls=vec_empty::<ProviderCall>(),items=vec_empty::<Json>(),text_bytes=0,terminal=false,failed=false }
+private fn provider_empty_call() -> ProviderCall = ProviderCall { index= -1,item="",id="",name="",arguments="",done=false }
+private fn provider_error(move state:Responses,code:i64,message:Arr u8 _) -> ProviderFeed
+  = ProviderFeed { state=state with { failed=true,terminal=true },events=vec_empty::<ProviderEvent>(),ok=false,error=Error { code=code,message=message,position=0 } }
+private fn provider_event(move state:Responses,kind:Arr u8 _,text:Arr u8 _,call:ProviderCall,value:Json) -> ProviderFeed
+  = ProviderFeed { state=state,events=vec_push(vec_empty::<ProviderEvent>(),ProviderEvent { kind=kind,text=text,call=call,value=value }),ok=true,error=no_error() }
+private fn provider_find(calls:Vec<ProviderCall>,index:i64,item:Arr u8 _) -> i64
+  = loop(i=0,found= -1) while found<0 && i<vec_len(calls) next(i+1,match vec_get(calls,i) { None => -1,Some(call) => if call.index==index && str_equal(call.item,item) then i else -1 }) yield found
+private fn provider_at(calls:Vec<ProviderCall>,index:i64) -> ProviderCall
+  = match vec_get(calls,index) { None => provider_empty_call(),Some(call) => call }
+fn responses_event(move state:Responses,event:SSEEvent) -> ProviderFeed
+  = if state.failed then provider_error(state,9,"provider stream already failed") else
+    if state.terminal then provider_error(state,71,"event after terminal provider response") else
+    let parsed=json_parse(event.data) in let doc=parsed.value in let kind=json_text(json_get(doc,"type").value) in
+    let number=json_int(json_get(doc,"sequence_number").value) in
+    if !parsed.ok || doc.kind!=6 || !kind.ok || !number.ok || number.value<0 || number.value<=state.sequence then provider_error(state,71,"invalid provider event or sequence") else
+    let current=state with { sequence=number.value } in let empty=provider_empty_call() in
+    if str_equal(kind.value,"response.created") then
+      let response=json_get(doc,"response").value in let id=json_text(json_get(response,"id").value) in
+      if !id.ok || len(id.value)==0 || len(current.response)!=0 then provider_error(current,71,"invalid provider response identity") else
+      provider_event(current with { response=id.value },"created","",empty,response) else
+    if len(current.response)==0 then provider_error(current,71,"provider stream missing response.created") else
+    if str_equal(kind.value,"response.output_text.delta") then
+      let text=json_text(json_get(doc,"delta").value) in if !text.ok || current.text_bytes+len(text.value)>1048576 then provider_error(current,27,"invalid or excessive provider text") else
+      provider_event(current with { text_bytes=current.text_bytes+len(text.value) },"text",text.value,empty,json_value_null()) else
+    if str_equal(kind.value,"response.output_item.added") then
+      let item=json_get(doc,"item").value in let item_kind=json_text(json_get(item,"type").value) in
+      if !item_kind.ok then provider_error(current,71,"invalid provider item") else
+      if !str_equal(item_kind.value,"function_call") then ProviderFeed { state=current,events=vec_empty::<ProviderEvent>(),ok=true,error=no_error() } else
+      let index=json_int(json_get(doc,"output_index").value) in let id=json_text(json_get(item,"id").value) in
+      let call=json_text(json_get(item,"call_id").value) in let name=json_text(json_get(item,"name").value) in
+      let duplicate=loop(i=0,found=false) while !found && i<vec_len(current.calls) next(i+1,let old=provider_at(current.calls,i) in old.index==index.value || str_equal(old.item,id.value) || str_equal(old.id,call.value)) yield found in
+      if !index.ok || index.value<0 || !id.ok || len(id.value)==0 || !call.ok || len(call.value)==0 || !name.ok || len(name.value)==0 || vec_len(current.calls)>=32 || duplicate then provider_error(current,71,"invalid or duplicate function call") else
+      let opened=ProviderCall { index=index.value,item=id.value,id=call.value,name=name.value,arguments="",done=false } in
+      provider_event(current with { calls=vec_push(current.calls,opened) },"tool_start","",opened,item) else
+    if str_equal(kind.value,"response.function_call_arguments.delta") || str_equal(kind.value,"response.function_call_arguments.done") then
+      let index=json_int(json_get(doc,"output_index").value) in let id=json_text(json_get(doc,"item_id").value) in
+      let slot=provider_find(current.calls,index.value,id.value) in let call=provider_at(current.calls,slot) in
+      let complete=str_equal(kind.value,"response.function_call_arguments.done") in
+      let text=json_text(json_get(doc,if complete then "arguments" else "delta").value) in
+      if !index.ok || !id.ok || slot<0 || call.done || !text.ok || len(call.arguments)+len(text.value)>131072 then provider_error(current,71,"invalid function argument fragment") else
+      if complete then
+        let arguments=json_parse(text.value) in
+        if !arguments.ok || arguments.value.kind!=6 || len(call.arguments)>0 && !str_equal(call.arguments,text.value) then provider_error(current,71,"function argument completion mismatch") else
+          let done=call with { arguments=text.value,done=true } in
+          ProviderFeed { state=current with { calls=vec_set(current.calls,slot,done) },events=vec_empty::<ProviderEvent>(),ok=true,error=no_error() } else
+        let changed=call with { arguments=concat(call.arguments,text.value) } in
+        provider_event(current with { calls=vec_set(current.calls,slot,changed) },"tool_delta",text.value,changed,json_value_null()) else
+    if str_equal(kind.value,"response.output_item.done") then
+      let item=json_get(doc,"item").value in if item.kind!=6 || vec_len(current.items)>=128 then provider_error(current,27,"invalid or excessive completed items") else
+      provider_event(current with { items=vec_push(current.items,item) },"item_done","",empty,item) else
+    if str_equal(kind.value,"response.completed") then
+      let response=json_get(doc,"response").value in let id=json_text(json_get(response,"id").value) in
+      let status=json_text(json_get(response,"status").value) in
+      let valid=loop(i=0,valid=true) while valid && i<vec_len(current.calls) next(i+1,provider_at(current.calls,i).done) yield valid in
+      if !id.ok || !str_equal(id.value,current.response) || !status.ok || !str_equal(status.value,"completed") || !valid then provider_error(current,71,"incomplete provider response or function arguments") else
+      let ready=loop(i=0,out=vec_empty::<ProviderEvent>()) while i<vec_len(current.calls) next(i+1,
+        vec_push(out,ProviderEvent { kind="tool_ready",text="",call=provider_at(current.calls,i),value=json_value_null() })) yield out in
+      ProviderFeed { state=current with { terminal=true },events=vec_push(ready,ProviderEvent { kind="completed",text="",call=empty,value=response }),ok=true,error=no_error() } else
+    if str_equal(kind.value,"response.failed") || str_equal(kind.value,"response.incomplete") || str_equal(kind.value,"error") then provider_error(current,5,"provider response failed or incomplete") else
+      ProviderFeed { state=current,events=vec_empty::<ProviderEvent>(),ok=true,error=no_error() }
+fn responses_items(state:Responses) -> Json
+  = let count=vec_len(state.items) in check count>=0 in json_value_array(arr(i in 0..count) match vec_get(state.items,i) { None => json_value_null(),Some(item) => item }).value
+fn responses_request(model:Arr u8 n,input:Json,tools:Json) -> BytesResult
+  = if n==0 || n>256 || input.kind!=5 || tools.kind!=5 then bytes_error(22,"invalid Responses request",0) else
+    bytes_ok(concat("{\"model\":",json_quote(model),",\"input\":",json_encode(input),",\"tools\":",json_encode(tools),",\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"]}"))
+fn responses_tool_output(call_id:Arr u8 n,output:Arr u8 _) -> JsonResult
+  = if n==0 then JsonResult { ok=false,value=json_value_null(),error=Error { code=22,message="empty function call ID",position=0 } } else
+    json_parse(concat("{\"type\":\"function_call_output\",\"call_id\":",json_quote(call_id),",\"output\":",json_quote(output),"}"))
+fn responses_continue(input:Json,items:Json,outputs:Json) -> JsonResult
+  = if input.kind!=5 || items.kind!=5 || outputs.kind!=5 then JsonResult { ok=false,value=json_value_null(),error=Error { code=22,message="continuation requires arrays",position=0 } } else
+    let a=json_array_values(input) in let b=json_array_values(items) in let c=json_array_values(outputs) in json_value_array(arr(i in 0..(len(a)+len(b)+len(c))) if i<len(a) then a[i] else if i-len(a)<len(b) then check i-len(a)>=0 && i-len(a)<len(b) in b[i-len(a)] else check i-len(a)-len(b)>=0 && i-len(a)-len(b)<len(c) in c[i-len(a)-len(b)])
+
+; Optional I/O driver is separate from the pure protocol decoder above. It
+; accepts the same typed transport used by TCP and pure-Neo TLS libraries.
+type ResponsesHTTP<C> = { io:HttpIO<C>,reader:HttpReader,sse:SSE,stream:Responses,events:Vec<ProviderEvent>,ok:bool,done:bool,error:Error }
+effect(net,time,process) fn responses_http_start<C>(io:HttpIO<C>,host:Arr u8 _,path:Arr u8 _,body:Arr u8 _,headers:Arr HttpHeader h,deadline:i64) -> ResponsesHTTP<C>
+  = let reader=http_start_io(io,"POST",path,host,body,deadline,16777216,headers) in
+    let content=http_response_header(reader,"content-type") in let mime=http_lower(str_trim(content.value)) in
+    let valid=reader.ok && reader.status==200 && content.ok && (str_equal(mime,"text/event-stream") || str_starts(mime,"text/event-stream;")) in
+    ResponsesHTTP::<C> { io=io,reader=reader,sse=sse_new(),stream=responses_new(),events=vec_empty::<ProviderEvent>(),ok=valid,done= !valid,
+      error=if valid then no_error() else if !reader.ok then reader.error else Error { code=reader.status,message="provider rejected request or did not return SSE",position=0 } }
+private fn responses_http_events<C>(move state:ResponsesHTTP<C>,events:Vec<SSEEvent>) -> ResponsesHTTP<C>
+  = loop(i=0,state=state) while state.ok && i<vec_len(events) next(i+1,
+    match vec_get(events,i) { None => state,Some(event) =>
+      let fed=responses_event(state.stream,event) in
+      let out=loop(j=0,out=state.events) while j<vec_len(fed.events) next(j+1,match vec_get(fed.events,j) { None => out,Some(e) => vec_push(out,e) }) yield out in
+      state with { stream=fed.state,events=out,ok=fed.ok,error=fed.error } }) yield state
+effect(net,time,process) fn responses_http_read<C>(move state:ResponsesHTTP<C>,deadline:i64) -> ResponsesHTTP<C>
+  = if !state.ok || state.done then state with { events=vec_empty::<ProviderEvent>() } else
+    let reader=http_read_next_io(state.io,state.reader,deadline) in
+    if !reader.ok then state with { reader=reader,ok=false,done=true,error=reader.error,events=vec_empty::<ProviderEvent>() } else
+    let fed=sse_feed(state.sse,reader.chunk,1048576) in
+    if !fed.ok then state with { reader=reader,ok=false,done=true,error=Error { code=27,message="SSE event limit",position=0 },events=vec_empty::<ProviderEvent>() } else
+    let current=responses_http_events(state with { reader=reader,sse=fed.state,events=vec_empty::<ProviderEvent>() },fed.events) in
+    if current.reader.done && !current.stream.terminal then current with { ok=false,done=true,error=Error { code=5,message="truncated provider stream",position=0 } } else
+      current with { done=current.reader.done || current.stream.terminal || !current.ok }

@@ -1,0 +1,145 @@
+import "sha1.neo"
+import "std:base64"
+import "std:json"
+import "std:vec"
+import "std:random"
+import "std:http_client"
+
+type WSFrame = { ok:bool,complete:bool,fin:bool,opcode:i64,payload:Arr u8 _,used:i64 }
+type WSEvent = { opcode:i64,payload:Arr u8 _ }
+sealed type WebSocket = { buffer:Arr u8 _,fragment:Arr u8 _,opcode:i64,server:bool,limit:i64,failed:bool,closed:bool }
+type WSFeed = { state:WebSocket,events:Vec<WSEvent>,ok:bool }
+private fn ws_opcode(op:i64) -> bool = op==0 || op==1 || op==2 || op==8 || op==9 || op==10
+private fn ws_utf8(text:Arr u8 _) -> bool = json_value_string(text).ok
+private fn ws_close_valid(bytes:Arr u8 n) -> bool
+  = if n==0 then true else if n<2 then false else
+    let code=str_byte(bytes,0)*256+str_byte(bytes,1) in
+    (code>=1000 && code<=1014 && code!=1004 && code!=1005 && code!=1006 || code>=3000 && code<=4999) && ws_utf8(str_slice(bytes,2,n))
+fn websocket_new(server:bool,limit:i64) -> WebSocket
+  = WebSocket { buffer="",fragment="",opcode=0,server=server,limit=limit,failed=limit<1 || limit>16777216,closed=false }
+fn websocket_frame(bytes:Arr u8 n,server:bool,limit:i64) -> WSFrame
+  = let empty=WSFrame { ok=true,complete=false,fin=false,opcode=0,payload="",used=0 } in
+    if n<2 then empty else
+    let first=str_byte(bytes,0) in let second=str_byte(bytes,1) in let code=bit_and(first,15) in
+    let small=bit_and(second,127) in let masked=second>=128 in let prefix=if small<126 then 2 else if small==126 then 4 else 10 in
+    if limit<1 || limit>16777216 || bit_and(first,112)!=0 || !ws_opcode(code) || masked!=server || code>=8 && (first<128 || small>125) then empty with { ok=false } else
+    if n<prefix then empty else
+    let count=if small<126 then small else loop(i=2,value=0) while i<prefix && value<=limit next(i+1,value*256+str_byte(bytes,i)) yield value in
+    if count>limit || small==126 && count<126 || small==127 && count<65536 then empty with { ok=false } else
+    let start=prefix+(if masked then 4 else 0) in
+    if n<start+count then empty else
+    check count>=0 && count<=16777216 in let payload=arr(i in 0..count) u8(bit_xor(str_byte(bytes,start+i),if masked then str_byte(bytes,prefix+i%4) else 0)) in
+    if code==8 && !ws_close_valid(payload) then empty with { ok=false } else
+      WSFrame { ok=true,complete=true,fin=first>=128,opcode=code,payload=payload,used=start+count }
+private fn ws_consume(move feed:WSFeed,frame:WSFrame) -> WSFeed
+  = let s=feed.state in let rest=str_slice(s.buffer,frame.used,len(s.buffer)) in
+    if s.closed then WSFeed { state=s with { failed=true },events=feed.events,ok=false } else
+    if frame.opcode>=8 then
+      WSFeed { state=s with { buffer=rest,closed=frame.opcode==8 },events=vec_push(feed.events,WSEvent { opcode=frame.opcode,payload=frame.payload }),ok=true } else
+    if frame.opcode==0 && s.opcode==0 || frame.opcode!=0 && s.opcode!=0 then WSFeed { state=s with { failed=true },events=feed.events,ok=false } else
+    let opcode=if frame.opcode==0 then s.opcode else frame.opcode in
+    let payload=concat(s.fragment,frame.payload) in
+    if len(payload)>s.limit || frame.fin && opcode==1 && !ws_utf8(payload) then WSFeed { state=s with { failed=true },events=feed.events,ok=false } else
+    WSFeed { state=s with { buffer=rest,fragment=if frame.fin then "" else payload,opcode=if frame.fin then 0 else opcode },
+      events=if frame.fin then vec_push(feed.events,WSEvent { opcode=opcode,payload=payload }) else feed.events,ok=true }
+fn websocket_feed(move state:WebSocket,chunk:Arr u8 n) -> WSFeed
+  = if state.failed || n>33554460 then WSFeed { state=state with { failed=true },events=vec_empty::<WSEvent>(),ok=false } else
+    let initial=WSFeed { state=state with { buffer=concat(state.buffer,chunk) },events=vec_empty::<WSEvent>(),ok=true } in
+    loop(feed=initial,again=true) while feed.ok && again next(
+      let frame=websocket_frame(feed.state.buffer,feed.state.server,feed.state.limit) in
+      if !frame.ok then WSFeed { state=feed.state with { failed=true },events=feed.events,ok=false } else if frame.complete then ws_consume(feed,frame) else feed,
+      websocket_frame(feed.state.buffer,feed.state.server,feed.state.limit).complete) yield feed
+fn websocket_encode(opcode:i64,fin:bool,payload:Arr u8 n,masked:bool,key:Arr u8 k) -> BytesResult
+  = if !ws_opcode(opcode) || n>16777216 || masked && k!=4 || opcode>=8 && (!fin || n>125) || opcode==8 && !ws_close_valid(payload) || opcode==1 && fin && !ws_utf8(payload) then bytes_error(22,"invalid WebSocket frame",0) else
+    let first=arr(i in 0..2) u8(if i==0 then opcode+(if fin then 128 else 0) else (if masked then 128 else 0)+(if n<126 then n else if n<65536 then 126 else 127)) in
+    let width=if n<126 then 0 else if n<65536 then 2 else 8 in check width>=0 in let length=arr(i in 0..width) u8(bit_and(shift_right(n,((if n<65536 then 2 else 8)-1-i)*8),255)) in
+    let bytes=arr(i in 0..n) u8(bit_xor(i64(payload[i]),if masked then str_byte(key,i%4) else 0)) in
+    bytes_ok(concat(first,length,if masked then key else "",bytes))
+effect(process) fn websocket_client_frame(opcode:i64,payload:Arr u8 n) -> BytesResult
+  = let key=random_bytes(4) in if !key.ok then key else websocket_encode(opcode,true,payload,true,key.value)
+effect(process) fn websocket_key() -> BytesResult
+  = let entropy=random_bytes(16) in if !entropy.ok then entropy else bytes_ok(base64_encode(entropy.value))
+fn websocket_accept(key:Arr u8 n) -> BytesResult
+  = let decoded=base64_decode(key) in if !decoded.ok || len(decoded.value)!=16 then bytes_error(22,"invalid WebSocket key",0) else
+    bytes_ok(base64_encode(websocket_sha1(concat(key,"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))))
+fn websocket_request(host:Arr u8 n,path:Arr u8 m,key:Arr u8 k,headers:Arr HttpHeader h) -> BytesResult
+  = let extra=http_headers_encode(headers) in
+    let reserved=loop(i=0,found=false) while !found && i<h next(i+1,check i>=0 && i<h in str_starts(http_lower(headers[i].name),"sec-websocket-")) yield found in
+    if !extra.ok || reserved || !websocket_accept(key).ok || n==0 || !http_field_value(host) || str_find(host," ").present || str_find(host,"\t").present || !http_request_target(path) then bytes_error(22,"invalid WebSocket upgrade",0) else
+    bytes_ok(concat("GET ",path," HTTP/1.1\r\nHost: ",host,"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ",key,"\r\n",extra.value,"\r\n"))
+private fn ws_header_token(value:Arr u8 n,token:Arr u8 _) -> bool
+  = loop(at=0,found=false) while !found && at<=n next(
+    let comma=str_find(str_slice(value,at,n),",") in if comma.present then at+comma.value+1 else n+1,
+    let comma=str_find(str_slice(value,at,n),",") in str_equal(http_lower(str_trim(str_slice(value,at,if comma.present then at+comma.value else n))),token)) yield found
+fn websocket_upgrade_valid(wire:Arr u8 n,key:Arr u8 _) -> bool
+  = let status=net_status(wire) in let expected=websocket_accept(key) in let boundary=str_find(wire,"\r\n\r\n") in
+    if !str_starts(wire,"HTTP/1.1 ") || !status.ok || status.value!=101 || !expected.ok || !boundary.present || boundary.value>16384 then false else
+    loop(at=http_line_end(wire,0)+2,valid=true,upgrade=false,connection=false,accept=false) while valid && at<boundary.value next(
+      let end=http_line_end(wire,at) in if end<at then boundary.value+1 else end+2,
+      let end=http_line_end(wire,at) in let line=str_slice(wire,at,end) in let colon=str_find(line,":") in
+      let name=http_lower(str_slice(line,0,colon.value)) in let value=str_trim(str_slice(line,colon.value+1,len(line))) in
+      colon.present && http_token(str_slice(line,0,colon.value)) && http_field_value(value) &&
+      (if str_equal(name,"sec-websocket-accept") then !accept && str_equal(value,expected.value) else
+       if str_equal(name,"upgrade") then !upgrade && str_equal(http_lower(value),"websocket") else
+       if str_equal(name,"sec-websocket-extensions") || str_equal(name,"sec-websocket-protocol") || str_equal(name,"transfer-encoding") || str_equal(name,"content-length") then false else true),
+      upgrade || str_starts(http_lower(str_slice(wire,at,http_line_end(wire,at))),"upgrade:"),
+      connection || let line=str_slice(wire,at,http_line_end(wire,at)) in let colon=str_find(line,":") in str_equal(http_lower(str_slice(line,0,colon.value)),"connection") && ws_header_token(str_trim(str_slice(line,colon.value+1,len(line))),"upgrade"),
+      accept || str_starts(http_lower(str_slice(wire,at,http_line_end(wire,at))),"sec-websocket-accept:")) yield valid && upgrade && connection && accept
+
+; The transport must call this on EOF. A partial frame/message or missing close
+; handshake is an abnormal closure rather than a completed application message.
+fn websocket_eof(state:WebSocket) -> IntResult
+  = if state.failed || !state.closed || len(state.buffer)!=0 then int_error(1006,"abnormal WebSocket closure",0) else int_ok(0)
+
+; Transport ownership stays with the caller's arena. Every operation propagates
+; the same deadline/cancellation through typed plain-TCP or TLS callbacks.
+sealed type WSLive<C> = { io:HttpIO<C>,decoder:WebSocket,pending:Vec<WSEvent>,cursor:i64,close_sent:bool,ok:bool,error:Error }
+private fn ws_event_at(events:Vec<WSEvent>,at:i64) -> WSEvent
+  = match vec_get(events,at) { None => WSEvent { opcode=0,payload="" },Some(event) => event }
+type WSRead<C> = { state:WSLive<C>,event:WSEvent,has_event:bool,closed:bool,ok:bool,error:Error }
+private fn ws_live_error<C>(move state:WSLive<C>,code:i64,message:Arr u8 _) -> WSLive<C>
+  = state with { ok=false,error=Error { code=code,message=message,position=0 } }
+private effect(net,time,process) fn ws_live_write<C>(move state:WSLive<C>,opcode:i64,payload:Arr u8 _,deadline:i64) -> WSLive<C>
+  = let encoded=websocket_client_frame(opcode,payload) in if !encoded.ok then ws_live_error(state,encoded.error.code,encoded.error.message) else
+    let write=state.io.write in let sent=write(state.io.context,encoded.value,deadline) in
+    if !sent.ok then ws_live_error(state,sent.error.code,sent.error.message) else
+    if sent.value!=len(encoded.value) then ws_live_error(state,5,"short WebSocket transport write") else state with { close_sent=state.close_sent || opcode==8 }
+private effect(net,time,process) fn ws_live_feed<C>(move state:WSLive<C>,wire:Arr u8 _,deadline:i64) -> WSLive<C>
+  = let feed=websocket_feed(state.decoder,wire) in
+    if !feed.ok then ws_live_error(state,71,"invalid WebSocket peer frame") else
+    let ready=state with { decoder=feed.state,pending=feed.events,cursor=0 } in
+    loop(i=0,state=ready) while state.ok && i<vec_len(feed.events) next(i+1,
+      let item=ws_event_at(feed.events,i) in
+      if item.opcode==9 then ws_live_write(state,10,item.payload,deadline) else
+      if item.opcode==8 && !state.close_sent then ws_live_write(state,8,item.payload,deadline) else state) yield state
+private effect(net,time,process) fn ws_live_fill<C>(move state:WSLive<C>,deadline:i64) -> WSLive<C>
+  = let read=state.io.read in let received=read(state.io.context,deadline) in
+    if !received.ok then ws_live_error(state,received.error.code,received.error.message) else
+    if len(received.value)==0 then
+      let end=websocket_eof(state.decoder) in if end.ok then state else ws_live_error(state,end.error.code,end.error.message) else
+      ws_live_feed(state,received.value,deadline)
+effect(net,time,process) fn websocket_connect_io<C>(io:HttpIO<C>,host:Arr u8 _,path:Arr u8 _,headers:Arr HttpHeader _,limit:i64,deadline:i64) -> WSLive<C>
+  = let initial=WSLive::<C> { io=io,decoder=websocket_new(false,limit),pending=vec_empty::<WSEvent>(),cursor=0,close_sent=false,ok=true,error=no_error() } in
+    if initial.decoder.failed then ws_live_error(initial,22,"invalid WebSocket receive limit") else
+    let key=websocket_key() in if !key.ok then ws_live_error(initial,key.error.code,key.error.message) else
+    let request=websocket_request(host,path,key.value,headers) in if !request.ok then ws_live_error(initial,request.error.code,request.error.message) else
+    let write=io.write in let sent=write(io.context,request.value,deadline) in
+    if !sent.ok then ws_live_error(initial,sent.error.code,sent.error.message) else
+    if sent.value!=len(request.value) then ws_live_error(initial,5,"short WebSocket handshake write") else
+    let read=io.read in
+    let response=loop(result=bytes_ok("")) while result.ok && !str_find(result.value,"\r\n\r\n").present next(
+      if len(result.value)>16384 then bytes_error(27,"WebSocket upgrade headers exceed limit",0) else
+      let part=read(io.context,deadline) in if !part.ok then part else if len(part.value)==0 then bytes_error(1006,"EOF during WebSocket upgrade",0) else
+      if len(part.value)>33554460 then bytes_error(27,"WebSocket transport chunk exceeds limit",0) else bytes_ok(concat(result.value,part.value))) yield result in
+    if !response.ok then ws_live_error(initial,response.error.code,response.error.message) else
+    if !websocket_upgrade_valid(response.value,key.value) then ws_live_error(initial,71,"WebSocket upgrade rejected") else
+      let boundary=str_find(response.value,"\r\n\r\n") in ws_live_feed(initial,str_slice(response.value,boundary.value+4,len(response.value)),deadline)
+effect(net,time,process) fn websocket_send_io<C>(move state:WSLive<C>,opcode:i64,payload:Arr u8 n,deadline:i64) -> WSLive<C>
+  = if !state.ok then state else
+    if state.close_sent || state.decoder.closed then ws_live_error(state,32,"WebSocket closing or closed") else
+    if opcode==0 || !ws_opcode(opcode) || n>state.decoder.limit then ws_live_error(state,22,"invalid WebSocket message") else ws_live_write(state,opcode,payload,deadline)
+effect(net,time,process) fn websocket_next_io<C>(move state:WSLive<C>,deadline:i64) -> WSRead<C>
+  = let ready=loop(state=state) while state.ok && state.cursor>=vec_len(state.pending) && !state.decoder.closed next(ws_live_fill(state,deadline)) yield state in
+    let has_event=ready.ok && ready.cursor<vec_len(ready.pending) in
+    WSRead::<C> { state=if has_event then ready with { cursor=ready.cursor+1 } else ready,event=if has_event then ws_event_at(ready.pending,ready.cursor) else WSEvent { opcode=0,payload="" },
+      has_event=has_event,closed=ready.decoder.closed && ready.close_sent && !has_event,ok=ready.ok,error=ready.error }

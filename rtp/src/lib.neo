@@ -1,0 +1,62 @@
+import "std:strings"
+import "std:vec"
+import "std:errors"
+
+; RFC 3550 packet framing and a bounded reordering window. This
+; library does not authenticate packets: SRTP authentication must precede use.
+type RTPPacket = { ok:bool,marker:bool,payload_type:i64,sequence:i64,timestamp:i64,ssrc:i64,csrc:Arr i64 _,extension_profile:i64,extension:Arr u8 _,payload:Arr u8 _ }
+private fn rtp_u16(bytes:Arr u8 _,at:i64) -> i64 = str_byte(bytes,at)*256+str_byte(bytes,at+1)
+private fn rtp_u32(bytes:Arr u8 _,at:i64) -> i64 = rtp_u16(bytes,at)*65536+rtp_u16(bytes,at+2)
+private fn rtp_invalid() -> RTPPacket
+  = RTPPacket { ok=false,marker=false,payload_type=0,sequence=0,timestamp=0,ssrc=0,csrc=arr(i in 0..0) 0,extension_profile= -1,extension="",payload="" }
+fn rtp_parse(bytes:Arr u8 n) -> RTPPacket
+  = let empty=rtp_invalid() in if n<12 || n>65535 || bit_and(str_byte(bytes,0),192)!=128 then empty else
+    let first=str_byte(bytes,0) in let count=bit_and(first,15) in let base=12+count*4 in
+    if n<base then empty else let extended=bit_and(first,16)!=0 in
+    if extended && n<base+4 then empty else
+    let extension_size=if extended then rtp_u16(bytes,base+2)*4 else 0 in let start=base+(if extended then 4+extension_size else 0) in
+    let padding=if bit_and(first,32)!=0 then str_byte(bytes,n-1) else 0 in
+    if start>n || padding>n-start || bit_and(first,32)!=0 && padding==0 then empty else
+    check count>=0 && count<=15 in RTPPacket { ok=true,marker=str_byte(bytes,1)>=128,payload_type=bit_and(str_byte(bytes,1),127),sequence=rtp_u16(bytes,2),timestamp=rtp_u32(bytes,4),ssrc=rtp_u32(bytes,8),
+      csrc=arr(i in 0..count) rtp_u32(bytes,12+i*4),extension_profile=if extended then rtp_u16(bytes,base) else -1,
+      extension=if extended then str_slice(bytes,base+4,start) else "",payload=str_slice(bytes,start,n-padding) }
+private fn rtp_word(value:i64,width:i64) -> Arr u8 _
+  = check width>=0 && width<=4 in arr(i in 0..width) u8(bit_and(shift_right(value,(width-1-i)*8),255))
+fn rtp_encode(packet:RTPPacket) -> BytesResult
+  = let count=len(packet.csrc) in let extended=packet.extension_profile>=0 in
+    let sources=loop(i=0,valid=true) while valid && i<count next(i+1,check i>=0 && i<count in packet.csrc[i]>=0 && packet.csrc[i]<=4294967295) yield valid in
+    if !packet.ok || count>15 || !sources || packet.payload_type<0 || packet.payload_type>127 || packet.sequence<0 || packet.sequence>65535 || packet.timestamp<0 || packet.timestamp>4294967295 || packet.ssrc<0 || packet.ssrc>4294967295 || packet.extension_profile>65535 || len(packet.extension)%4!=0 || !extended && len(packet.extension)>0 || len(packet.extension)+len(packet.payload)+12+count*4>65535 then bytes_error(22,"invalid RTP packet",0) else
+    let header=arr(i in 0..2) u8(if i==0 then 128+count+(if extended then 16 else 0) else packet.payload_type+(if packet.marker then 128 else 0)) in
+    let csrc=loop(i=0,bytes="") while i<count next(i+1,check i>=0 && i<count in concat(bytes,rtp_word(packet.csrc[i],4))) yield bytes in
+    bytes_ok(concat(header,rtp_word(packet.sequence,2),rtp_word(packet.timestamp,4),rtp_word(packet.ssrc,4),csrc,
+      if extended then concat(rtp_word(packet.extension_profile,2),rtp_word(len(packet.extension)/4,2),packet.extension) else "",packet.payload))
+sealed type RTPOrder = { initialized:bool,next_sequence:i64,pending:Vec<RTPPacket>,waiting:i64,last_now:i64,lost:i64,late:i64 }
+type RTPRelease = { state:RTPOrder,packets:Vec<RTPPacket>,ok:bool }
+fn rtp_order_new() -> RTPOrder = RTPOrder { initialized=false,next_sequence=0,pending=vec_empty::<RTPPacket>(),waiting= -1,last_now=0,lost=0,late=0 }
+private fn rtp_distance(sequence:i64,next_sequence:i64) -> i64
+  = let delta=(sequence-next_sequence+65536)%65536 in if delta>=32768 then delta-65536 else delta
+private fn rtp_slot(packets:Vec<RTPPacket>,sequence:i64) -> i64
+  = loop(i=0,slot= -1) while slot<0 && i<vec_len(packets) next(i+1,match vec_get(packets,i) { None => -1,Some(p) => if p.sequence==sequence then i else -1 }) yield slot
+private fn rtp_remove(packets:Vec<RTPPacket>,slot:i64) -> Vec<RTPPacket>
+  = loop(i=0,out=vec_empty::<RTPPacket>()) while i<vec_len(packets) next(i+1,match vec_get(packets,i) { None => out,Some(p) => if i==slot then out else vec_push(out,p) }) yield out
+private fn rtp_pop_step(move released:RTPRelease,now:i64,force:bool) -> RTPRelease
+  = let s=released.state in let slot=rtp_slot(s.pending,s.next_sequence) in
+    if slot>=0 then match vec_get(s.pending,slot) { None => released,Some(p) => RTPRelease { state=s with { pending=rtp_remove(s.pending,slot),next_sequence=(s.next_sequence+1)%65536,waiting= -1 },packets=vec_push(released.packets,p),ok=true } } else
+    let waiting=if s.waiting<0 then now else s.waiting in if !force && now-waiting<40 then released with { state=s with { waiting=waiting } } else
+    let distance=loop(i=0,nearest=65535) while i<vec_len(s.pending) next(i+1,match vec_get(s.pending,i) { None => nearest,Some(p) => let distance=(p.sequence-s.next_sequence+65536)%65536 in if distance<nearest then distance else nearest }) yield nearest in
+    released with { state=s with { next_sequence=(s.next_sequence+distance)%65536,lost=s.lost+distance,waiting= -1 } }
+fn rtp_order_tick(move state:RTPOrder,now:i64,force:bool) -> RTPRelease
+  = if now<state.last_now || now<0 then RTPRelease { state=state,packets=vec_empty::<RTPPacket>(),ok=false } else
+    loop(release=RTPRelease { state=state with { last_now=now },packets=vec_empty::<RTPPacket>(),ok=true },running=true,force=force) while running && vec_len(release.state.pending)>0 next(
+      rtp_pop_step(release,now,force),
+      rtp_slot(release.state.pending,release.state.next_sequence)>=0 || force || release.state.waiting>=0 && now-release.state.waiting>=40,
+      false) yield release
+fn rtp_order_push(move state:RTPOrder,packet:RTPPacket,now:i64) -> RTPRelease
+  = if !packet.ok || now<0 || now<state.last_now then RTPRelease { state=state,packets=vec_empty::<RTPPacket>(),ok=false } else
+    let s=if state.initialized then state else state with { initialized=true,next_sequence=packet.sequence } in
+    let distance=rtp_distance(packet.sequence,s.next_sequence) in
+    if distance<0 || rtp_slot(s.pending,packet.sequence)>=0 then RTPRelease { state=s with { late=s.late+1,last_now=now },packets=vec_empty::<RTPPacket>(),ok=true } else
+    let s=if distance>128 then s with { lost=s.lost+distance,pending=vec_empty::<RTPPacket>(),next_sequence=packet.sequence,waiting= -1 } else s in
+    let pending=vec_push(s.pending,packet) in rtp_order_tick(s with { pending=pending },now,vec_len(pending)>=8)
+fn rtp_order_lost(state:RTPOrder) -> i64 = state.lost
+fn rtp_order_late(state:RTPOrder) -> i64 = state.late

@@ -1,0 +1,133 @@
+{
+  "system": {
+    "system": "Linux",
+    "node": "39768372f2bc",
+    "release": "6.8.0-64-generic",
+    "version": "#67-Ubuntu SMP PREEMPT_DYNAMIC Sun Jun 15 20:23:40 UTC 2025",
+    "machine": "aarch64",
+    "processor": "aarch64"
+  },
+  "binaries": {
+    "agent-path": {
+      "sha256": "cabed8adfb338a98aaf9d4c40d0bbd59d7776d60267870a0dd335a19938ec6ec",
+      "bytes": 2450888,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "codecs": {
+      "sha256": "f578b016368be19f1cf23aec2451602111377b8547ea86fe0e3cff306c49d562",
+      "bytes": 417696,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "providers": {
+      "sha256": "bb7e18edf5ff489115b6771c6eca6806b7584dcbe63982768be48cbcaa11f37b",
+      "bytes": 599664,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "mcp": {
+      "sha256": "6d275e50a43d7a7f76d9bc67ed04f41df63adc9535e49b13b8c40d3598dca0dd",
+      "bytes": 608216,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "reactor": {
+      "sha256": "8f4a4b9c63f69092ff4e3bc6b40339199659c45a00ecd62ba10e9eabdba394ac",
+      "bytes": 55640,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "network": {
+      "sha256": "c21029dc131834d52f34692e6f2e13170f439512500736fea578c63f5519b59d",
+      "bytes": 1016832,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "media": {
+      "sha256": "38ec7f0dca8a0a299e037c35a380ab04fb1295e6e89e0b96c51e4931633c463b",
+      "bytes": 392616,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "stun": {
+      "sha256": "9c1f2f6432b3b7125fc7d10d529aa9273ae3dc2da5b09c44dd020b3896476dc0",
+      "bytes": 64984,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "udp": {
+      "sha256": "965fee51d17fa0a20dfd66fd377ac4b5b568097ec81084e82e136987d87635a7",
+      "bytes": 52336,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "srtp": {
+      "sha256": "410cc3034405125de80fb51bcf6e16de08b48ab6156cf4141a975550f095392b",
+      "bytes": 326160,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "websocket-live": {
+      "sha256": "9c353428553f7d68980a790c86e3a735823fa0a8dbf3943425c807d59ca7e1c9",
+      "bytes": 1052872,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    },
+    "standalone": {
+      "sha256": "bccaab929053ea0d9cf0d4bc49aa0aa650079f39572b38e9169dc60e50302b75",
+      "bytes": 617592,
+      "interpreter": false,
+      "shared_libraries": [],
+      "undefined_symbols": []
+    }
+  },
+  "empty_roots": {
+    "udp": {
+      "passed": true,
+      "files": [
+        "/program"
+      ],
+      "stdout_sha256": "dd725ede89990d38c58752b8fe2fadcca9de121f34d44d3145e5e4c905eb7673"
+    },
+    "websocket-sha1": {
+      "passed": true,
+      "files": [
+        "/program"
+      ],
+      "stdout_sha256": "507e2ce3c522082b61100d566ac9cea86168493b56387c368e6ef01f5c539fdc"
+    },
+    "media": {
+      "passed": true,
+      "files": [
+        "/program"
+      ],
+      "stdout_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+    },
+    "crypto": {
+      "passed": true,
+      "files": [
+        "/program"
+      ],
+      "stdout_sha256": "8e2ad95bd12cb7d48570707d4b13505d58f3f446839d0a3025d79995b7af0bbe"
+    },
+    "self-exec-reactor": {
+      "passed": true,
+      "files": [
+        "/program"
+      ],
+      "stdout_sha256": "5d0fbcf9046de0b216e444eabee5c99eae233eea4ea1370b0539b19caa4e027b"
+    }
+  }
+}

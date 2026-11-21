@@ -1,0 +1,4 @@
+[package]
+name="neo-document-store"
+version="0.1.0"
+entry="src/lib.neo"

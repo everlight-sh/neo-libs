@@ -1,0 +1,21 @@
+import "../oauth2/src/lib.neo"
+import "std:io"
+private effect(fs,net,time,process) fn fixture_provider(url:HTTPURL,method:Arr u8 n,headers:Arr HttpHeader h,body:Arr u8 m)->HttpResult
+  = if str_equal(url.target,"/token") then
+      check str_equal(method,"POST") && str_equal(web_query_get(body,"code").value,"code+special&value") && str_equal(web_query_get(body,"client_secret").value,"test-secret&value") && len(web_query_get(body,"code_verifier").value)==43 in
+      HttpResult {ok=true,status=200,body="{\"access_token\":\"opaque-test-token\",\"token_type\":\"Bearer\"}",error=no_error()} else
+    check str_equal(url.target,"/userinfo") && str_equal(method,"GET") && h==2 in
+    check str_equal(headers[0].name,"Authorization") && str_equal(headers[0].value,"Bearer opaque-test-token") in
+    HttpResult {ok=true,status=200,body="{\"sub\":\"account-42\",\"name\":\"Test User\"}",error=no_error()}
+effect fn main()->unit
+  = let provider=oauth_provider("https://issuer.test/authorize","https://issuer.test/token","https://issuer.test/userinfo","test-client","http://127.0.0.1/callback","openid profile") in check provider.ok in
+    let key="test-oauth-key-at-least-32-bytes-long" in let start=oauth_begin(provider,key,1000) in check start.ok in
+    let question=str_find(start.url,"?") in let query=str_slice(start.url,question.value+1,len(start.url)) in let state=web_query_get(query,"state").value in
+    let callback_query=concat("code=",url_encode("code+special&value",false),"&state=",state) in let callback=oauth_callback(provider,callback_query,start.cookie,key,1001) in check callback.ok in
+    check str_equal(web_query_get(query,"code_challenge").value,base64url_encode(sha256(callback.verifier))) in
+    check !oauth_callback(provider,callback_query,"",key,1001).ok && !oauth_callback(provider,callback_query,concat(start.cookie,"x"),key,1001).ok in
+    check !oauth_callback(provider,callback_query,start.cookie,key,601000).ok && !oauth_callback(provider,"code=x&state=wrong",start.cookie,key,1001).ok in
+    let other=oauth_provider("https://issuer.test/authorize","https://issuer.test/token","https://issuer.test/userinfo","other-client","http://127.0.0.1/callback","openid") in
+    check !oauth_callback(other,callback_query,start.cookie,key,1001).ok in
+    let identity=oauth_exchange(OAuthHTTP {request=function(fixture_provider)},provider,callback,"test-secret&value") in check identity.ok && str_equal(identity.subject,"account-42") && str_equal(identity.issuer,"https://issuer.test") in
+    let printed=print_out("OAuth PKCE, state binding and authenticated identity OK\n") in noop()

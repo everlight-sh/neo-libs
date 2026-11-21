@@ -1,0 +1,7 @@
+[package]
+name="neo-oauth2"
+version="0.1.0"
+entry="src/lib.neo"
+
+[dependencies]
+jwt={path="../jwt",version="0.1.0"}

@@ -1,0 +1,40 @@
+import "std:strings"
+import "std:errors"
+
+; Mono PCM16 little endian and G.711. No native codec/library calls.
+fn g711_ulaw_sample(byte:i64) -> i64
+  = let u=bit_xor(bit_and(byte,255),255) in let v=shift_left(bit_and(u,15)*8+132,bit_and(shift_right(u,4),7)) in
+    if bit_and(u,128)!=0 then 132-v else v-132
+fn g711_alaw_sample(byte:i64) -> i64
+  = let a=bit_xor(bit_and(byte,255),85) in let exponent=bit_and(shift_right(a,4),7) in
+    let value=bit_and(a,15)*16 in let v=if exponent==0 then value+8 else shift_left(value+264,exponent-1) in
+    if bit_and(a,128)==0 then 0-v else v
+fn g711_ulaw_encode_sample(input:i64) -> u8
+  = let sample=if input< -32768 then -32768 else if input>32767 then 32767 else input in let sign=if sample<0 then 128 else 0 in let magnitude=if sample<0 then 0-sample else sample in
+    let value=(if magnitude>32635 then 32635 else magnitude)+132 in
+    let exponent=loop(e=0) while e<7 && value>=shift_left(256,e) next(e+1) yield e in
+    u8(bit_xor(bit_or(sign,bit_or(shift_left(exponent,4),bit_and(shift_right(value,exponent+3),15))),255))
+fn g711_alaw_encode_sample(input:i64) -> u8
+  = let sample=if input< -32768 then -32768 else if input>32767 then 32767 else input in let sign=if sample>=0 then 213 else 85 in let magnitude=if sample>=0 then sample else 0-sample-1 in
+    let value=shift_right(if magnitude>32767 then 32767 else magnitude,3) in
+    let exponent=loop(e=0) while e<8 && value>shift_left(32,e)-1 next(e+1) yield e in
+    u8(bit_xor(if exponent>=8 then 127 else bit_or(shift_left(exponent,4),bit_and(shift_right(value,if exponent<2 then 1 else exponent),15)),sign))
+fn pcm16_sample(bytes:Arr u8 n,index:i64) -> IntResult
+  = if index<0 || index>=n/2 || n%2!=0 then int_error(22,"invalid PCM16 sample",index) else
+    let raw=str_byte(bytes,index*2)+str_byte(bytes,index*2+1)*256 in int_ok(if raw>=32768 then raw-65536 else raw)
+fn g711_decode(bytes:Arr u8 n,alaw:bool) -> BytesResult
+  = if n>8388608 then bytes_error(27,"audio frame limit",0) else
+    bytes_ok(arr(i in 0..n*2) let sample=if alaw then g711_alaw_sample(str_byte(bytes,i/2)) else g711_ulaw_sample(str_byte(bytes,i/2)) in
+      u8(bit_and(shift_right(bit_and(sample,65535),(i%2)*8),255)))
+fn g711_encode(pcm:Arr u8 n,alaw:bool) -> BytesResult
+  = if n%2!=0 || n>16777216 then bytes_error(22,"invalid PCM16 frame",0) else
+    bytes_ok(arr(i in 0..n/2) let sample=pcm16_sample(pcm,i).value in if alaw then g711_alaw_encode_sample(sample) else g711_ulaw_encode_sample(sample))
+fn audio_duration_us(bytes:i64,format:Arr u8 _) -> IntResult
+  = if bytes<0 || bytes>16777216 then int_error(22,"invalid audio frame bound",0) else
+    if str_equal(format,"pcm16") then if bytes%2!=0 then int_error(22,"odd PCM16 frame",0) else int_ok(bytes*1000000/48000) else
+    if str_equal(format,"g711_ulaw") || str_equal(format,"g711_alaw") then int_ok(bytes*1000000/8000) else int_error(22,"unsupported audio format",0)
+fn audio_voiced(bytes:Arr u8 n,format:Arr u8 _) -> IntResult
+  = let pcm=str_equal(format,"pcm16") in let ulaw=str_equal(format,"g711_ulaw") in let alaw=str_equal(format,"g711_alaw") in
+    if !(pcm || ulaw || alaw) || pcm && n%2!=0 then int_error(22,"invalid audio frame or format",0) else
+    int_ok(if loop(i=0,voiced=false) while !voiced && i<(if pcm then n/2 else n) next(i+1,
+      let sample=if pcm then pcm16_sample(bytes,i).value else if ulaw then g711_ulaw_sample(str_byte(bytes,i)) else g711_alaw_sample(str_byte(bytes,i)) in sample>128 || sample< -128) yield voiced then 1 else 0)
